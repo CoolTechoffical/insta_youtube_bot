@@ -1,38 +1,23 @@
-import os
 import threading
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
-from flask import Flask
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from config import BOT_TOKEN
 from bot.start import start
-from bot.downloader import download_handler
-
-# 🌐 Dummy web server for Render
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is running!"
+from bot.reels import handle_link, quality_callback
+import app  # web server
 
 def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.app.run(host="0.0.0.0", port=10000)
 
 def main():
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    threading.Thread(target=run_web).start()
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, download_handler)
-    )
+    app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    print("🤖 Insta & YouTube Helper Bot running...")
-    tg_app.run_polling()
+    app_tg.add_handler(CommandHandler("start", start))
+    app_tg.add_handler(CallbackQueryHandler(quality_callback))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+
+    app_tg.run_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_web).start()
     main()
