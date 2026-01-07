@@ -36,10 +36,15 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(query.message.chat.id, ChatAction.UPLOAD_VIDEO)
 
     ydl_opts = {
-        "format": f"bestvideo[height<={quality}]+bestaudio/best",
-        "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-        "merge_output_format": "mp4",
-        "quiet": True
+    "format": (
+        f"bestvideo[ext=mp4][height<=?{quality}]/"
+        f"bestvideo[height<=?{quality}]/"
+        "best[ext=mp4]/best"
+    ),
+    "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
+    "merge_output_format": "mp4",
+    "quiet": True,
+    "noplaylist": True
     }
 
     try:
