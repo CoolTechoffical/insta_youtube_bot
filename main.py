@@ -3,29 +3,31 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 from config import BOT_TOKEN
 from app import run_web
 from bot.start import start
-from bot.handler import video_handler
+from bot.handler import video_handler, callback_handler
 
 def main():
-    # Web server (Render requirement)
-    threading.Thread(target=run_web).start()
+    # 🌐 Start web service (Render requirement)
+    threading.Thread(target=run_web, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(
         MessageHandler(
             filters.TEXT | filters.VIDEO | filters.Document.VIDEO,
             video_handler
         )
     )
+    tg_app.add_handler(CallbackQueryHandler(callback_handler))
 
-    print("🤖 Video Resizer Bot Running")
-    app.run_polling()
+    print("🤖 Video Resizer Bot Running...")
+    tg_app.run_polling()
 
 if __name__ == "__main__":
     main()
