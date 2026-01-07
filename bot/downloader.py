@@ -11,23 +11,16 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def ytdlp_download(url: str):
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0"
+    "format": "mp4/best",
+    "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
+    "quiet": True,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
+    "extractor_args": {
+        "youtube": {
+            "skip": ["dash", "hls"]
         }
+    }
     }
 
     with YoutubeDL(ydl_opts) as ydl:
