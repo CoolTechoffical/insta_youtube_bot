@@ -24,12 +24,15 @@ def run_web():
 def main():
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = Client(
-        "video-helper-bot",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN
-    )
+    class Bot(Client):
+
+    def __init__(self):
+        super().__init__(
+            name=SESSION,
+            api_id=API_ID,
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+        )
 
     print("🤖 Pyrogram Video Helper Bot running...")
     app.run()
