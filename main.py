@@ -2,19 +2,12 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-)
-
-from config import BOT_TOKEN
-from bot.handler import start, video_handler, callback_handler
+from pyrogram import Client, filters
+from config import API_ID, API_HASH, BOT_TOKEN
+from bot.handlers import start, video_handler, callback_handler
 
 
-# 🔹 Minimal web server for Render
+# 🔹 Render health check
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -31,14 +24,19 @@ def run_web():
 def main():
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = Client(
+        "video-helper-bot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.TEXT, video_handler))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(filters.command("start")(start))
+    app.add_handler(filters.video | filters.text)(video_handler)
+    app.add_handler(filters.callback_query)(callback_handler)
 
-    print("🤖 Video Helper Bot running...")
-    app.run_polling()
+    print("🤖 Pyrogram Video Helper Bot running...")
+    app.run()
 
 
 if __name__ == "__main__":
