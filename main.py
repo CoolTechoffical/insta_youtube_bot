@@ -2,12 +2,12 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from pyrogram import Client, filters
+from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN
-from bot.handler import start, video_handler, callback_handler
+
+import bot.handlers  # IMPORTANT: registers handlers
 
 
-# 🔹 Render health check
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,10 +30,6 @@ def main():
         api_hash=API_HASH,
         bot_token=BOT_TOKEN
     )
-
-    app.add_handler(filters.command("start")(start))
-    app.add_handler(filters.video | filters.text)(video_handler)
-    app.add_handler(filters.callback_query)(callback_handler)
 
     print("🤖 Pyrogram Video Helper Bot running...")
     app.run()
