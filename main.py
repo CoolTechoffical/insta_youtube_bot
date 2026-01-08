@@ -1,4 +1,7 @@
+import os
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -6,28 +9,37 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+
 from config import BOT_TOKEN
-from app import run_web
-from bot.start import start
-from bot.handler import video_handler, callback_handler
+from bot.handlers import start, video_handler, callback_handler
+
+
+# 🔹 Minimal web server for Render
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
 
 def main():
-    # 🌐 Start web service (Render requirement)
     threading.Thread(target=run_web, daemon=True).start()
 
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(
-        MessageHandler(
-            filters.TEXT | filters.VIDEO | filters.Document.VIDEO,
-            video_handler
-        )
-    )
-    tg_app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.TEXT, video_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
-    print("🤖 Video Resizer Bot Running...")
-    tg_app.run_polling()
+    print("🤖 Video Helper Bot running...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
