@@ -5,7 +5,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN
 
-import bot.handlers  # IMPORTANT: registers handlers
+import bot.handler # IMPORTANT: registers handlers
 
 
 class HealthHandler(BaseHTTPRequestHandler):
