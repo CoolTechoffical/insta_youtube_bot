@@ -23,3 +23,5 @@ MAX_TELEGRAM_UPLOAD_MB = 50
 # 🔹 FFmpeg binary paths (Render usually auto-detects)
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 FFPROBE_PATH = os.getenv("FFPROBE_PATH", "ffprobe")
+MAX_DB_SIZE_MB = 50
+MAX_DB_DURATION = 15 * 60
