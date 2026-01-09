@@ -11,7 +11,6 @@ def get_video_info(path):
         path
     ]
     data = json.loads(subprocess.check_output(cmd))
-
     duration = float(data["format"]["duration"])
     stream = next(s for s in data["streams"] if s.get("width"))
     return int(stream["width"]), int(stream["height"]), duration
@@ -22,8 +21,8 @@ def resize_video(input_path, output_path, height):
         "ffmpeg", "-y",
         "-i", input_path,
         "-vf", f"scale=-2:{height}",
-        "-c:v", "libx264",
         "-preset", "ultrafast",
+        "-c:v", "libx264",
         "-crf", "28",
         "-c:a", "copy",
         output_path
