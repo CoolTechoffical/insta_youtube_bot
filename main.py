@@ -36,7 +36,3 @@ def main():
     bot = Bot()
     print("🤖 Pyrogram Video Helper Bot running...")
     bot.run()
-
-
-if __name__ == "__main__":
-    main()
