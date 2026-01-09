@@ -1,19 +1,18 @@
+# bot/video.py
 import subprocess
 import json
-
 
 def get_video_info(path):
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-show_entries", "stream=width,height",
-        "-of", "json",
-        path
+        "-of", "json", path
     ]
     data = json.loads(subprocess.check_output(cmd))
-    duration = float(data["format"]["duration"])
+    duration = int(float(data["format"]["duration"]))
     stream = next(s for s in data["streams"] if s.get("width"))
-    return int(stream["width"]), int(stream["height"]), duration
+    return stream["width"], stream["height"], duration
 
 
 def resize_video(input_path, output_path, height):
