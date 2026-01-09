@@ -4,7 +4,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN
-from bot.handlers import register_handlers
+from bot.handler import register_handlers
 
 
 # 🔹 Render health check
