@@ -1,5 +1,5 @@
-from pyrogram import Client
 import asyncio
+from pyrogram import Client, idle
 
 from config import API_ID, API_HASH, BOT_TOKEN
 from bot.handler import register_handlers
@@ -21,5 +21,4 @@ async def main():
     print("🤖 Bot running...")
     await idle()
 
-from pyrogram.idle import idle
 asyncio.run(main())
