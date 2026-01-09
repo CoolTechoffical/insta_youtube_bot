@@ -28,7 +28,7 @@ def run_web():
 
 
 # -------------------------
-# 🤖 Telegram Bot
+# 🤖 Pyrogram Bot
 # -------------------------
 app = Client(
     "video_bot",
@@ -39,23 +39,28 @@ app = Client(
 
 
 async def main():
-    # Start web server in background
+    # Start web server (Render requirement)
     threading.Thread(target=run_web, daemon=True).start()
 
     # Init DB
     init_db()
 
-    # Register handlers
+    # Register handlers BEFORE start
     register_handlers(app)
 
-    # Start bot
+    # Start bot (NON-BLOCKING)
     await app.start()
+    print("✅ Bot connected to Telegram")
 
-    # Start worker
+    # Start background worker
     asyncio.create_task(worker(app))
 
-    print("🤖 Bot + Web Server running on Render")
+    # Keep process alive
     await idle()
 
+    # Graceful shutdown (optional)
+    await app.stop()
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
