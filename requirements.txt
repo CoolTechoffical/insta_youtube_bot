@@ -1,7 +1,5 @@
 pyrogram==2.0.106
 tgcrypto==1.2.5
-
-yt-dlp==2024.12.23
-
-aiohttp==3.9.1
-requests==2.31.0
+flask
+opencv-python
+numpy
