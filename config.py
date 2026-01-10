@@ -6,4 +6,4 @@ API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
 
 # 🔹 Bot token (from @BotFather)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-WEBHOOK_URL = "https://insta-youtube-bot.onrender.com/webhook"
+
