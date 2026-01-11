@@ -3,13 +3,21 @@ import cv2
 import uuid
 import time
 import shutil
+import asyncio
 import numpy as np
 from PIL import Image
 from pyrogram import Client, filters
+
 from config import API_ID, API_HASH, BOT_TOKEN, MAX_IMAGES, MAX_SAFE_SECONDS
 from user_settings import set_count, get_count
-from mongo_db import create_job, update_job, get_active_jobs
+from mongo_db import (
+    create_job,
+    update_job,
+    get_job,
+    get_active_jobs
+)
 
+# ---------------- DIRECTORIES ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
@@ -17,13 +25,15 @@ OUTPUT_DIR = "output"
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
+# ---------------- FACE CASCADE ----------------
 face_cascade = cv2.CascadeClassifier(
     "haarcascade_frontalface_default.xml"
 )
 
+# ---------------- BOT ----------------
 bot = Client(
     "highlight_bot",
-    api_id=API_ID,
+    api_id=int(API_ID),
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
@@ -43,21 +53,25 @@ async def settings(_, msg):
     if len(msg.command) < 2:
         return await msg.reply("Usage: /settings <1-200>")
 
-    count = int(msg.command[1])
+    try:
+        count = int(msg.command[1])
+    except ValueError:
+        return await msg.reply("❌ Enter a number")
+
     if count < 1 or count > MAX_IMAGES:
-        return await msg.reply("❌ Max 200 images (Render limit)")
+        return await msg.reply("❌ Max 200 images (server limit)")
 
     set_count(msg.from_user.id, count)
-    await msg.reply(f"✅ Set to {count}")
+    await msg.reply(f"✅ Highlight count set to {count}")
 
-# ---------------- VIDEO ----------------
+# ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
     max_images = get_count(user_id)
 
     status = await msg.reply("⬇️ Downloading video...")
-    video_path = await msg.download(file_name=DOWNLOAD_DIR + "/")
+    video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     job_id = str(uuid.uuid4())
 
@@ -69,18 +83,18 @@ async def video_handler(_, msg):
         "saved": 0,
         "target": max_images,
         "status": "processing",
-        "stage": "extract",
         "updated": time.time()
     })
 
-    await status.edit("🎞 Processing (auto-recovery enabled)")
+    await status.edit("🎞 Processing (auto-recovery ON)")
     await process_job(job_id, status)
 
 # ---------------- CORE PROCESS ----------------
-async def process_job(job_id, status_msg):
-    from mongo_db import get_job
-
+async def process_job(job_id, status_msg=None, resumed=False):
     job = get_job(job_id)
+    if not job:
+        return
+
     start_time = time.time()
 
     cap = cv2.VideoCapture(job["video_path"])
@@ -89,9 +103,12 @@ async def process_job(job_id, status_msg):
     prev_gray = None
 
     while cap.isOpened():
+        # ---- SERVER SAFETY TIME LIMIT ----
         if time.time() - start_time > MAX_SAFE_SECONDS:
             update_job(job_id, {"status": "waiting"})
-            await status_msg.edit("⏳ Server busy, auto-resume soon")
+            if status_msg:
+                await status_msg.edit("⏳ Server busy, auto-resume soon")
+            cap.release()
             return
 
         ret, frame = cap.read()
@@ -100,11 +117,13 @@ async def process_job(job_id, status_msg):
 
         job["last_frame"] += 1
 
+        # ---- RESIZE (MEMORY SAFE) ----
         if frame.shape[1] > 1280:
             scale = 1280 / frame.shape[1]
             frame = cv2.resize(
                 frame,
-                (1280, int(frame.shape[0] * scale))
+                (1280, int(frame.shape[0] * scale)),
+                interpolation=cv2.INTER_AREA
             )
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -128,47 +147,72 @@ async def process_job(job_id, status_msg):
             "updated": time.time()
         })
 
+        if status_msg:
+            await status_msg.edit(
+                f"📸 {job['saved']}/{job['target']} images extracted"
+            )
+
         if job["saved"] >= job["target"]:
             break
 
     cap.release()
-
     await create_pdf_and_send(job_id, status_msg)
 
-# ---------------- PDF ----------------
-async def create_pdf_and_send(job_id, status_msg):
-    from mongo_db import get_job
-
+# ---------------- PDF CREATION ----------------
+async def create_pdf_and_send(job_id, status_msg=None):
     job = get_job(job_id)
+    if not job:
+        return
+
     images = sorted(
-        [f for f in os.listdir(FRAME_DIR) if f.startswith(job_id)]
+        f for f in os.listdir(FRAME_DIR) if f.startswith(job_id)
     )
 
     if not images:
-        return await status_msg.edit("❌ No highlights found")
+        if status_msg:
+            await status_msg.edit("❌ No highlights detected")
+        return
 
     first = Image.open(os.path.join(FRAME_DIR, images[0])).convert("RGB")
     rest = [
-        Image.open(os.path.join(FRAME_DIR, i)).convert("RGB")
-        for i in images[1:]
+        Image.open(os.path.join(FRAME_DIR, img)).convert("RGB")
+        for img in images[1:]
     ]
 
     pdf_path = f"{OUTPUT_DIR}/{job_id}.pdf"
-    first.save(pdf_path, save_all=True, append_images=rest, resolution=150)
+    first.save(
+        pdf_path,
+        save_all=True,
+        append_images=rest,
+        resolution=150
+    )
 
     await bot.send_document(
         job["user_id"],
         pdf_path,
-        caption=f"✅ {len(images)} highlights"
+        caption=f"✅ {len(images)} highlights extracted"
     )
 
     update_job(job_id, {"status": "completed"})
+
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
 
-# ---------------- AUTO RESUME ON START ----------------
+# ---------------- AUTO RESUME ----------------
 async def resume_pending_jobs():
     jobs = get_active_jobs()
     for job in jobs:
         update_job(job["job_id"], {"status": "processing"})
-        await process_job(job["job_id"], None)
+        await process_job(job["job_id"], None, resumed=True)
+
+# ---------------- MAIN ----------------
+async def main():
+    print("🔄 Resuming pending jobs...")
+    await resume_pending_jobs()
+
+    print("🤖 Bot started")
+    await bot.start()
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
