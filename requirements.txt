@@ -3,3 +3,4 @@ tgcrypto==1.2.5
 flask
 opencv-python
 numpy
+pillow
