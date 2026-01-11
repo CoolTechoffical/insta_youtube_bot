@@ -1,8 +1,8 @@
 pyrogram==2.0.106
 tgcrypto==1.2.5
-flask
-opencv-python-headless
-numpy
-pillow
-pymongo
-dnspython
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+pillow==10.2.0
+
+pymongo==4.6.2
+dnspython==2.6.1
