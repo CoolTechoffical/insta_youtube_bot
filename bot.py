@@ -1,7 +1,6 @@
 import os
 import cv2
 import numpy as np
-import mediapipe as mp
 from PIL import Image
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
@@ -15,8 +14,9 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(FRAME_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-mp_face = mp.solutions.face_detection.FaceDetection(
-    model_selection=0, min_detection_confidence=0.6
+# Haar face detector
+face_cascade = cv2.CascadeClassifier(
+    "haarcascade_frontalface_default.xml"
 )
 
 bot = Client(
@@ -26,28 +26,30 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ---------------- START ----------------
+# ---------- START ----------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
         "👋 Send a video\n\n"
         "✨ Face-priority highlights\n"
-        "🧍 Face + Body visible\n"
-        "📄 Output as PDF\n\n"
-        "⚙️ /settings <count> (1–1000)"
+        "🧍 Full frame (face + body)\n"
+        "📄 Output: PDF\n\n"
+        "⚙️ /settings <count> (max 200)"
     )
 
-# ---------------- SETTINGS ----------------
+# ---------- SETTINGS ----------
 @bot.on_message(filters.command("settings") & filters.regex(r"\d+"))
 async def settings(_, msg):
     count = int(msg.text.split()[-1])
-    if count < 1 or count > 1000:
-        await msg.reply("❌ Choose between 1 – 1000")
+
+    if count < 1 or count > 200:
+        await msg.reply("❌ Render limit: 1 – 200 images")
         return
+
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Highlight count set to {count}")
 
-# ---------------- VIDEO HANDLER ----------------
+# ---------- VIDEO HANDLER ----------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
@@ -58,7 +60,8 @@ async def video_handler(_, msg):
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // (max_images * 2))
+
+    step = max(1, total_frames // (max_images * 3))
 
     await status.edit(
         "🎞 Processing video...\n"
@@ -69,7 +72,7 @@ async def video_handler(_, msg):
     prev_gray = None
     frame_no = 0
     saved = 0
-    collected = []
+    images = []
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -80,32 +83,34 @@ async def video_handler(_, msg):
         if frame_no % step != 0:
             continue
 
-        h, w, _ = frame.shape
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
 
-        # ---------- FACE DETECTION ----------
+        # -------- FACE SCORE --------
         face_score = 0
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        faces = mp_face.process(rgb)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.2,
+            minNeighbors=5,
+            minSize=(60, 60)
+        )
 
-        if faces.detections:
-            for d in faces.detections:
-                box = d.location_data.relative_bounding_box
-                face_area = (box.width * w) * (box.height * h)
-                frame_area = w * h
-                ratio = face_area / frame_area
+        for (x, y, fw, fh) in faces:
+            face_area = fw * fh
+            frame_area = w * h
+            ratio = face_area / frame_area
 
-                # Medium face = best (face + body)
-                if 0.02 < ratio < 0.2:
-                    face_score += 150
-                else:
-                    face_score += 80
+            # Medium face = face + body visible
+            if 0.02 < ratio < 0.2:
+                face_score += 150
+            else:
+                face_score += 80
 
-                # Face position (top = body visible)
-                if box.ymin < 0.4:
-                    face_score += 50
+            # Face near top = body visible
+            if y < h * 0.4:
+                face_score += 50
 
-        # ---------- MOTION ----------
+        # -------- MOTION SCORE --------
         motion_score = 0
         if prev_gray is not None:
             diff = cv2.absdiff(prev_gray, gray)
@@ -113,13 +118,13 @@ async def video_handler(_, msg):
 
         prev_gray = gray
 
-        # ---------- SHARPNESS ----------
+        # -------- SHARPNESS --------
         sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-        sharp_score = 20 if sharpness > 150 else 0
+        sharp_score = 20 if sharpness > 120 else 0
 
         total_score = face_score + motion_score + sharp_score
 
-        # ---------- SAVE FULL FRAME ----------
+        # -------- SAVE FULL FRAME --------
         if total_score > 120:
             img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
             cv2.imwrite(
@@ -127,7 +132,7 @@ async def video_handler(_, msg):
                 frame,
                 [cv2.IMWRITE_JPEG_QUALITY, 95]
             )
-            collected.append(img_path)
+            images.append(img_path)
             saved += 1
 
             progress = int((frame_no / total_frames) * 100)
@@ -142,30 +147,30 @@ async def video_handler(_, msg):
 
     cap.release()
 
-    if not collected:
+    if not images:
         await status.edit("❌ No highlights detected")
         return
 
-    # ---------- CREATE PDF ----------
+    # -------- CREATE PDF --------
     await status.edit("📄 Creating PDF...")
-    images = [Image.open(p).convert("RGB") for p in collected]
+    pil_images = [Image.open(p).convert("RGB") for p in images]
     pdf_path = f"{OUTPUT_DIR}/{user_id}_highlights.pdf"
 
-    images[0].save(
+    pil_images[0].save(
         pdf_path,
         save_all=True,
-        append_images=images[1:],
-        resolution=300
+        append_images=pil_images[1:],
+        resolution=200
     )
 
     await status.edit("📤 Uploading PDF...")
     await msg.reply_document(
         pdf_path,
         caption=(
-            "✅ Face + Body Highlight PDF\n"
-            f"📸 Images: {len(images)}\n"
-            "🖼 Full Frame | High Quality"
+            "✅ Face + Body Highlights\n"
+            f"📸 Images: {len(pil_images)}\n"
+            "🖼 Full frame | High quality"
         )
     )
 
-    await status.edit("✅ Completed 🎉")
+    await status.edit("✅ Done 🎉")
