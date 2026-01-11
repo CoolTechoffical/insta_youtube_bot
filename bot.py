@@ -5,7 +5,7 @@ from config import API_ID, API_HASH, BOT_TOKEN
 from db import create_job, get_pending_jobs
 from worker import process_job
 
-bot = Client("auto_recovery_bot", API_ID, API_HASH, BOT_TOKEN)
+bot = Client("auto_recovery_bot", API_ID, API_HASH, BOT_TOKEN,in_memory=True)
 
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
