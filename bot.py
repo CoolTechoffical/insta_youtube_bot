@@ -6,7 +6,6 @@ import shutil
 import asyncio
 import numpy as np
 from PIL import Image
-
 from aiohttp import web
 from pyrogram import Client, filters
 
@@ -35,12 +34,12 @@ face_cascade = cv2.CascadeClassifier(
 # ---------------- BOT ----------------
 bot = Client(
     "highlight_bot",
-    api_id=int(API_ID),
+    api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# ---------------- START ----------------
+# ---------------- START COMMAND ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
@@ -49,7 +48,7 @@ async def start(_, msg):
         "🔁 Auto-recovery enabled"
     )
 
-# ---------------- SETTINGS ----------------
+# ---------------- SETTINGS COMMAND ----------------
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
     if len(msg.command) < 2:
@@ -66,7 +65,7 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Set to {count}")
 
-# ---------------- VIDEO ----------------
+# ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
@@ -104,6 +103,7 @@ async def process_job(job_id, status_msg=None):
     prev_gray = None
 
     while cap.isOpened():
+        # Check max safe seconds
         if time.time() - start_time > MAX_SAFE_SECONDS:
             update_job(job_id, {"status": "waiting"})
             if status_msg:
@@ -117,13 +117,10 @@ async def process_job(job_id, status_msg=None):
 
         job["last_frame"] += 1
 
+        # Resize for Render safe
         if frame.shape[1] > 1280:
             scale = 1280 / frame.shape[1]
-            frame = cv2.resize(
-                frame,
-                (1280, int(frame.shape[0] * scale)),
-                interpolation=cv2.INTER_AREA
-            )
+            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
@@ -147,9 +144,7 @@ async def process_job(job_id, status_msg=None):
         })
 
         if status_msg:
-            await status_msg.edit(
-                f"📸 {job['saved']}/{job['target']} images"
-            )
+            await status_msg.edit(f"📸 {job['saved']}/{job['target']} images")
 
         if job["saved"] >= job["target"]:
             break
@@ -157,7 +152,7 @@ async def process_job(job_id, status_msg=None):
     cap.release()
     await create_pdf_and_send(job_id, status_msg)
 
-# ---------------- PDF ----------------
+# ---------------- PDF CREATION ----------------
 async def create_pdf_and_send(job_id, status_msg=None):
     job = get_job(job_id)
     if not job:
@@ -171,45 +166,38 @@ async def create_pdf_and_send(job_id, status_msg=None):
         return
 
     first = Image.open(os.path.join(FRAME_DIR, images[0])).convert("RGB")
-    rest = [
-        Image.open(os.path.join(FRAME_DIR, i)).convert("RGB")
-        for i in images[1:]
-    ]
+    rest = [Image.open(os.path.join(FRAME_DIR, i)).convert("RGB") for i in images[1:]]
 
     pdf_path = f"{OUTPUT_DIR}/{job_id}.pdf"
     first.save(pdf_path, save_all=True, append_images=rest, resolution=150)
 
-    await bot.send_document(
-        job["user_id"],
-        pdf_path,
-        caption=f"✅ {len(images)} highlights"
-    )
+    await bot.send_document(job["user_id"], pdf_path, caption=f"✅ {len(images)} highlights")
 
     update_job(job_id, {"status": "completed"})
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
 
-# ---------------- AUTO RESUME ----------------
+# ---------------- AUTO-RESUME ----------------
 async def resume_pending_jobs():
     loop = asyncio.get_running_loop()
     jobs = await loop.run_in_executor(None, get_active_jobs)
-
     for job in jobs:
         update_job(job["job_id"], {"status": "processing"})
         await process_job(job["job_id"], None)
 
-# ---------------- WEB SERVER ----------------
+# ---------------- WEB HEALTH ----------------
 async def health(request):
     return web.Response(text="Bot running")
 
+# ---------------- MAIN ----------------
 async def main():
-    # resume jobs
     await resume_pending_jobs()
 
-    # start bot
+    # Initialize Pyrogram client
+    await bot.initialize()
     await bot.start()
 
-    # start web server (Render requirement)
+    # Start async web server
     app = web.Application()
     app.router.add_get("/", health)
 
@@ -225,5 +213,6 @@ async def main():
 
     await asyncio.Event().wait()
 
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     asyncio.run(main())
