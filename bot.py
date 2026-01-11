@@ -6,6 +6,8 @@ import shutil
 import asyncio
 import numpy as np
 from PIL import Image
+
+from aiohttp import web
 from pyrogram import Client, filters
 
 from config import API_ID, API_HASH, BOT_TOKEN, MAX_IMAGES, MAX_SAFE_SECONDS
@@ -62,9 +64,9 @@ async def settings(_, msg):
         return await msg.reply("❌ Max 200 images (server limit)")
 
     set_count(msg.from_user.id, count)
-    await msg.reply(f"✅ Highlight count set to {count}")
+    await msg.reply(f"✅ Set to {count}")
 
-# ---------------- VIDEO HANDLER ----------------
+# ---------------- VIDEO ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
@@ -90,20 +92,18 @@ async def video_handler(_, msg):
     await process_job(job_id, status)
 
 # ---------------- CORE PROCESS ----------------
-async def process_job(job_id, status_msg=None, resumed=False):
+async def process_job(job_id, status_msg=None):
     job = get_job(job_id)
     if not job:
         return
 
     start_time = time.time()
-
     cap = cv2.VideoCapture(job["video_path"])
     cap.set(cv2.CAP_PROP_POS_FRAMES, job["last_frame"])
 
     prev_gray = None
 
     while cap.isOpened():
-        # ---- SERVER SAFETY TIME LIMIT ----
         if time.time() - start_time > MAX_SAFE_SECONDS:
             update_job(job_id, {"status": "waiting"})
             if status_msg:
@@ -117,7 +117,6 @@ async def process_job(job_id, status_msg=None, resumed=False):
 
         job["last_frame"] += 1
 
-        # ---- RESIZE (MEMORY SAFE) ----
         if frame.shape[1] > 1280:
             scale = 1280 / frame.shape[1]
             frame = cv2.resize(
@@ -149,7 +148,7 @@ async def process_job(job_id, status_msg=None, resumed=False):
 
         if status_msg:
             await status_msg.edit(
-                f"📸 {job['saved']}/{job['target']} images extracted"
+                f"📸 {job['saved']}/{job['target']} images"
             )
 
         if job["saved"] >= job["target"]:
@@ -158,60 +157,72 @@ async def process_job(job_id, status_msg=None, resumed=False):
     cap.release()
     await create_pdf_and_send(job_id, status_msg)
 
-# ---------------- PDF CREATION ----------------
+# ---------------- PDF ----------------
 async def create_pdf_and_send(job_id, status_msg=None):
     job = get_job(job_id)
     if not job:
         return
 
-    images = sorted(
-        f for f in os.listdir(FRAME_DIR) if f.startswith(job_id)
-    )
+    images = sorted(f for f in os.listdir(FRAME_DIR) if f.startswith(job_id))
 
     if not images:
         if status_msg:
-            await status_msg.edit("❌ No highlights detected")
+            await status_msg.edit("❌ No highlights found")
         return
 
     first = Image.open(os.path.join(FRAME_DIR, images[0])).convert("RGB")
     rest = [
-        Image.open(os.path.join(FRAME_DIR, img)).convert("RGB")
-        for img in images[1:]
+        Image.open(os.path.join(FRAME_DIR, i)).convert("RGB")
+        for i in images[1:]
     ]
 
     pdf_path = f"{OUTPUT_DIR}/{job_id}.pdf"
-    first.save(
-        pdf_path,
-        save_all=True,
-        append_images=rest,
-        resolution=150
-    )
+    first.save(pdf_path, save_all=True, append_images=rest, resolution=150)
 
     await bot.send_document(
         job["user_id"],
         pdf_path,
-        caption=f"✅ {len(images)} highlights extracted"
+        caption=f"✅ {len(images)} highlights"
     )
 
     update_job(job_id, {"status": "completed"})
-
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
 
 # ---------------- AUTO RESUME ----------------
 async def resume_pending_jobs():
-    jobs = get_active_jobs()
+    loop = asyncio.get_running_loop()
+    jobs = await loop.run_in_executor(None, get_active_jobs)
+
     for job in jobs:
         update_job(job["job_id"], {"status": "processing"})
-        await process_job(job["job_id"], None, resumed=True)
+        await process_job(job["job_id"], None)
 
-# ---------------- MAIN ----------------
+# ---------------- WEB SERVER ----------------
+async def health(request):
+    return web.Response(text="Bot running")
+
 async def main():
-    print("🔄 Resuming pending jobs...")
+    # resume jobs
     await resume_pending_jobs()
 
-    print("🤖 Bot started")
+    # start bot
     await bot.start()
+
+    # start web server (Render requirement)
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"🌐 Web service running on port {port}")
+    print("🤖 Bot started")
+
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
