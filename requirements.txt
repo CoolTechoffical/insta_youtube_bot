@@ -4,4 +4,3 @@ flask
 opencv-python
 numpy
 pillow
-mediapipe
