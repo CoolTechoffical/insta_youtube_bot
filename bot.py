@@ -43,8 +43,9 @@ async def settings(_, msg):
 @bot.on_message(filters.command("settings") & filters.regex(r"\d+"))
 async def set_settings(_, msg):
     count = int(msg.text.split()[-1])
-    if count < 1 or count > 30:
-        await msg.reply("❌ Choose between 1–30 images")
+
+    if count < 1 or count > 1000:
+        await msg.reply("❌ Choose between 1 – 1000 images")
         return
 
     set_count(msg.from_user.id, count)
@@ -58,14 +59,21 @@ async def video_handler(_, msg):
     status = await msg.reply("⬇️ Downloading video...")
     video_path = await msg.download(file_name=DOWNLOAD_DIR + "/")
 
-    await status.edit("🎞 Processing video...\nProgress: 0%")
-
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # Dynamic step so we can reach 1000 images
+    step = max(1, total_frames // (max_images * 3))
+
+    await status.edit(
+        "🎞 Processing video...\n"
+        f"📸 Target images: {max_images}\n"
+        "⏳ Progress: 0%"
+    )
+
     prev_gray = None
-    saved = 0
     frame_no = 0
+    saved = 0
     image_paths = []
 
     while cap.isOpened():
@@ -74,7 +82,7 @@ async def video_handler(_, msg):
             break
 
         frame_no += 1
-        if frame_no % 25 != 0:
+        if frame_no % step != 0:
             continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -83,15 +91,22 @@ async def video_handler(_, msg):
             diff = cv2.absdiff(prev_gray, gray)
             motion = np.sum(diff)
 
-            if motion > 3_000_000:
+            if motion > 2_000_000:  # softer threshold for more images
                 img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
-                cv2.imwrite(img_path, frame)
+
+                # 🔥 HIGH QUALITY SAVE
+                cv2.imwrite(
+                    img_path,
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95]
+                )
+
                 image_paths.append(img_path)
                 saved += 1
 
                 progress = int((frame_no / total_frames) * 100)
                 await status.edit(
-                    f"🎞 Processing video...\n"
+                    "🎞 Processing video...\n"
                     f"📸 Extracted: {saved}/{max_images}\n"
                     f"⏳ Progress: {progress}%"
                 )
@@ -106,16 +121,29 @@ async def video_handler(_, msg):
         await status.edit("❌ No highlights detected")
         return
 
-    await status.edit("📄 Creating PDF...")
+    await status.edit("📄 Creating HIGH-QUALITY PDF...")
 
-    images = [Image.open(img).convert("RGB") for img in image_paths]
+    images = []
+    for img in image_paths:
+        images.append(Image.open(img).convert("RGB"))
+
     pdf_path = f"{OUTPUT_DIR}/{user_id}_highlights.pdf"
-    images[0].save(pdf_path, save_all=True, append_images=images[1:])
+
+    images[0].save(
+        pdf_path,
+        save_all=True,
+        append_images=images[1:],
+        resolution=300.0
+    )
 
     await status.edit("📤 Uploading PDF...")
     await msg.reply_document(
         pdf_path,
-        caption=f"✅ Highlight PDF\n📸 Images: {len(images)}"
+        caption=(
+            "✅ Highlight PDF Generated\n"
+            f"📸 Images: {len(images)}\n"
+            "🖼 Quality: High (Original)"
+        )
     )
 
-    await status.edit("✅ Done! Send another video 🎥")
+    await status.edit("✅ Completed successfully 🎉")
