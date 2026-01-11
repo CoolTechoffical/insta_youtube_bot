@@ -14,5 +14,7 @@ def run_bot():
     bot.run()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Run pyrogram in MAIN thread
+    bot.run()
