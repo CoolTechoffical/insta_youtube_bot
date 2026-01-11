@@ -6,7 +6,3 @@ API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
 
 # 🔹 Bot token (from @BotFather)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-
-
-MAX_IMAGES = 200
-MAX_SAFE_SECONDS = 18   # Render safe
