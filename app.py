@@ -9,9 +9,9 @@ app = Flask(__name__)
 def home():
     return "Bot running with MongoDB auto-recovery"
 
-def run_bot():
-    asyncio.run(resume_pending_jobs())
-    bot.run()
+def flask():
+    app.run(host="0.0.0.0", port=10000)
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
