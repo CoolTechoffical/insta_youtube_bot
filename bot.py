@@ -1,218 +1,176 @@
 import os
 import cv2
-import uuid
-import time
-import shutil
-import asyncio
 import numpy as np
 from PIL import Image
-from aiohttp import web
 from pyrogram import Client, filters
-
-from config import API_ID, API_HASH, BOT_TOKEN, MAX_IMAGES, MAX_SAFE_SECONDS
+from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
-from mongo_db import (
-    create_job,
-    update_job,
-    get_job,
-    get_active_jobs
-)
 
-# ---------------- DIRECTORIES ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
 
-for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
-    os.makedirs(d, exist_ok=True)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(FRAME_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ---------------- FACE CASCADE ----------------
+# Haar face detector
 face_cascade = cv2.CascadeClassifier(
     "haarcascade_frontalface_default.xml"
 )
 
-# ---------------- BOT ----------------
 bot = Client(
-    "highlight_bot",
+    "face_body_highlight_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# ---------------- START COMMAND ----------------
+# ---------- START ----------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 Send a video\n"
-        "⚙ /settings <count>\n"
-        "🔁 Auto-recovery enabled"
+        "👋 Send a video\n\n"
+        "✨ Face-priority highlights\n"
+        "🧍 Full frame (face + body)\n"
+        "📄 Output: PDF\n\n"
+        "⚙️ /settings <count> (max 200)"
     )
 
-# ---------------- SETTINGS COMMAND ----------------
-@bot.on_message(filters.command("settings"))
+# ---------- SETTINGS ----------
+@bot.on_message(filters.command("settings") & filters.regex(r"\d+"))
 async def settings(_, msg):
-    if len(msg.command) < 2:
-        return await msg.reply("Usage: /settings <1-200>")
+    count = int(msg.text.split()[-1])
 
-    try:
-        count = int(msg.command[1])
-    except ValueError:
-        return await msg.reply("❌ Enter a number")
-
-    if count < 1 or count > MAX_IMAGES:
-        return await msg.reply("❌ Max 200 images (server limit)")
+    if count < 1 or count > 200:
+        await msg.reply("❌ Render limit: 1 – 200 images")
+        return
 
     set_count(msg.from_user.id, count)
-    await msg.reply(f"✅ Set to {count}")
+    await msg.reply(f"✅ Highlight count set to {count}")
 
-# ---------------- VIDEO HANDLER ----------------
+# ---------- VIDEO HANDLER ----------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
     max_images = get_count(user_id)
 
     status = await msg.reply("⬇️ Downloading video...")
-    video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
+    video_path = await msg.download(file_name=DOWNLOAD_DIR + "/")
 
-    job_id = str(uuid.uuid4())
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    create_job({
-        "job_id": job_id,
-        "user_id": user_id,
-        "video_path": video_path,
-        "last_frame": 0,
-        "saved": 0,
-        "target": max_images,
-        "status": "processing",
-        "updated": time.time()
-    })
+    step = max(1, total_frames // (max_images * 3))
 
-    await status.edit("🎞 Processing (auto-recovery ON)")
-    await process_job(job_id, status)
-
-# ---------------- CORE PROCESS ----------------
-async def process_job(job_id, status_msg=None):
-    job = get_job(job_id)
-    if not job:
-        return
-
-    start_time = time.time()
-    cap = cv2.VideoCapture(job["video_path"])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, job["last_frame"])
+    await status.edit(
+        "🎞 Processing video...\n"
+        f"🎯 Target: {max_images}\n"
+        "⏳ Progress: 0%"
+    )
 
     prev_gray = None
+    frame_no = 0
+    saved = 0
+    images = []
 
     while cap.isOpened():
-        # Check max safe seconds
-        if time.time() - start_time > MAX_SAFE_SECONDS:
-            update_job(job_id, {"status": "waiting"})
-            if status_msg:
-                await status_msg.edit("⏳ Server busy, auto-resume soon")
-            cap.release()
-            return
-
         ret, frame = cap.read()
         if not ret:
             break
 
-        job["last_frame"] += 1
-
-        # Resize for Render safe
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
+        frame_no += 1
+        if frame_no % step != 0:
+            continue
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        h, w = gray.shape
 
-        motion = 0
+        # -------- FACE SCORE --------
+        face_score = 0
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.2,
+            minNeighbors=5,
+            minSize=(60, 60)
+        )
+
+        for (x, y, fw, fh) in faces:
+            face_area = fw * fh
+            frame_area = w * h
+            ratio = face_area / frame_area
+
+            # Medium face = face + body visible
+            if 0.02 < ratio < 0.2:
+                face_score += 150
+            else:
+                face_score += 80
+
+            # Face near top = body visible
+            if y < h * 0.4:
+                face_score += 50
+
+        # -------- MOTION SCORE --------
+        motion_score = 0
         if prev_gray is not None:
-            motion = int(np.sum(cv2.absdiff(prev_gray, gray)) / 1_000_000)
+            diff = cv2.absdiff(prev_gray, gray)
+            motion_score = int(np.sum(diff) / 1_000_000)
+
         prev_gray = gray
 
-        score = motion + (150 if len(faces) else 0)
+        # -------- SHARPNESS --------
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        sharp_score = 20 if sharpness > 120 else 0
 
-        if score > 120:
-            img_path = f"{FRAME_DIR}/{job_id}_{job['saved']}.jpg"
-            cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            job["saved"] += 1
+        total_score = face_score + motion_score + sharp_score
 
-        update_job(job_id, {
-            "last_frame": job["last_frame"],
-            "saved": job["saved"],
-            "updated": time.time()
-        })
+        # -------- SAVE FULL FRAME --------
+        if total_score > 120:
+            img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
+            cv2.imwrite(
+                img_path,
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
+            images.append(img_path)
+            saved += 1
 
-        if status_msg:
-            await status_msg.edit(f"📸 {job['saved']}/{job['target']} images")
+            progress = int((frame_no / total_frames) * 100)
+            await status.edit(
+                "🎞 Processing...\n"
+                f"📸 Saved: {saved}/{max_images}\n"
+                f"⏳ Progress: {progress}%"
+            )
 
-        if job["saved"] >= job["target"]:
+        if saved >= max_images:
             break
 
     cap.release()
-    await create_pdf_and_send(job_id, status_msg)
-
-# ---------------- PDF CREATION ----------------
-async def create_pdf_and_send(job_id, status_msg=None):
-    job = get_job(job_id)
-    if not job:
-        return
-
-    images = sorted(f for f in os.listdir(FRAME_DIR) if f.startswith(job_id))
 
     if not images:
-        if status_msg:
-            await status_msg.edit("❌ No highlights found")
+        await status.edit("❌ No highlights detected")
         return
 
-    first = Image.open(os.path.join(FRAME_DIR, images[0])).convert("RGB")
-    rest = [Image.open(os.path.join(FRAME_DIR, i)).convert("RGB") for i in images[1:]]
+    # -------- CREATE PDF --------
+    await status.edit("📄 Creating PDF...")
+    pil_images = [Image.open(p).convert("RGB") for p in images]
+    pdf_path = f"{OUTPUT_DIR}/{user_id}_highlights.pdf"
 
-    pdf_path = f"{OUTPUT_DIR}/{job_id}.pdf"
-    first.save(pdf_path, save_all=True, append_images=rest, resolution=150)
+    pil_images[0].save(
+        pdf_path,
+        save_all=True,
+        append_images=pil_images[1:],
+        resolution=200
+    )
 
-    await bot.send_document(job["user_id"], pdf_path, caption=f"✅ {len(images)} highlights")
+    await status.edit("📤 Uploading PDF...")
+    await msg.reply_document(
+        pdf_path,
+        caption=(
+            "✅ Face + Body Highlights\n"
+            f"📸 Images: {len(pil_images)}\n"
+            "🖼 Full frame | High quality"
+        )
+    )
 
-    update_job(job_id, {"status": "completed"})
-    shutil.rmtree(FRAME_DIR)
-    os.makedirs(FRAME_DIR, exist_ok=True)
-
-# ---------------- AUTO-RESUME ----------------
-async def resume_pending_jobs():
-    loop = asyncio.get_running_loop()
-    jobs = await loop.run_in_executor(None, get_active_jobs)
-    for job in jobs:
-        update_job(job["job_id"], {"status": "processing"})
-        await process_job(job["job_id"], None)
-
-# ---------------- WEB HEALTH ----------------
-async def health(request):
-    return web.Response(text="Bot running")
-
-# ---------------- MAIN ----------------
-async def main():
-    await resume_pending_jobs()
-
-    # Initialize Pyrogram client
-    await bot.initialize()
-    await bot.start()
-
-    # Start async web server
-    app = web.Application()
-    app.router.add_get("/", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-    print(f"🌐 Web service running on port {port}")
-    print("🤖 Bot started")
-
-    await asyncio.Event().wait()
-
-# ---------------- RUN ----------------
-if __name__ == "__main__":
-    asyncio.run(main())
+    await status.edit("✅ Done 🎉")
