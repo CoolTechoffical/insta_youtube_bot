@@ -3,6 +3,3 @@ tgcrypto==1.2.5
 opencv-python-headless
 numpy
 pillow
-pymongo
-dnspython
-aiohttp
