@@ -1,16 +1,12 @@
 import threading
-from flask import Flask, jsonify
-from bot import bot, tasks, resume_tasks
+from flask import Flask
+from bot import bot, resume_tasks
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "✅ Auto-Resume Highlight Bot Running"
-
-@app.route("/status")
-def status():
-    return jsonify(tasks)
+    return "✅ Highlight Bot Running"
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
