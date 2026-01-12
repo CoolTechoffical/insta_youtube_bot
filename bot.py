@@ -1,6 +1,8 @@
 import os
 import cv2
+import time
 import json
+import sqlite3
 import shutil
 import numpy as np
 from PIL import Image
@@ -12,33 +14,69 @@ from user_settings import set_count, get_count
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
-TASKS_FILE = "tasks.json"
+DB_PATH = "tasks.db"
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
-# ---------------- SAFE JSON LOAD ----------------
-def load_tasks():
-    if not os.path.exists(TASKS_FILE):
-        return {}
-    try:
-        with open(TASKS_FILE, "r") as f:
-            data = f.read().strip()
-            if not data:
-                return {}
-            return json.loads(data)
-    except Exception:
-        print("⚠️ tasks.json corrupted, resetting")
-        return {}
+# ---------------- DATABASE ----------------
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cur = conn.cursor()
 
-tasks = load_tasks()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS tasks (
+    user_id TEXT PRIMARY KEY,
+    video_path TEXT,
+    last_frame INTEGER,
+    saved_images TEXT,
+    max_images INTEGER,
+    status TEXT
+)
+""")
+conn.commit()
 
-# ---------------- SAFE JSON SAVE ----------------
-def save_tasks():
-    tmp = TASKS_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(tasks, f)
-    os.replace(tmp, TASKS_FILE)
+def save_task(user_id, video_path, last_frame, images, max_images, status):
+    cur.execute("""
+    INSERT OR REPLACE INTO tasks
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        video_path,
+        last_frame,
+        json.dumps(images),
+        max_images,
+        status
+    ))
+    conn.commit()
+
+def get_task(user_id):
+    cur.execute("SELECT * FROM tasks WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": row[0],
+        "video_path": row[1],
+        "last_frame": row[2],
+        "saved_images": json.loads(row[3]),
+        "max_images": row[4],
+        "status": row[5]
+    }
+
+def get_pending_tasks():
+    cur.execute("SELECT * FROM tasks WHERE status IN ('processing','paused')")
+    rows = cur.fetchall()
+    tasks = []
+    for r in rows:
+        tasks.append({
+            "user_id": r[0],
+            "video_path": r[1],
+            "last_frame": r[2],
+            "saved_images": json.loads(r[3]),
+            "max_images": r[4],
+            "status": r[5]
+        })
+    return tasks
 
 # ---------------- FACE DETECTOR ----------------
 face_cascade = cv2.CascadeClassifier(
@@ -47,7 +85,7 @@ face_cascade = cv2.CascadeClassifier(
 
 # ---------------- BOT ----------------
 bot = Client(
-    "auto_resume_highlight_bot",
+    "highlight_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -66,138 +104,162 @@ async def start(_, msg):
 
 # ---------------- SETTINGS ----------------
 @bot.on_message(filters.command("settings"))
-async def settings(_, msg):
+async def settings_cmd(_, msg):
     if len(msg.command) < 2:
         await msg.reply("Usage: /settings <1-200>")
         return
 
     count = int(msg.command[1])
     if count < 1 or count > 200:
-        await msg.reply("❌ Max 200 images (Render limit)")
+        await msg.reply("❌ Render limit: 1–200 only")
         return
 
     set_count(msg.from_user.id, count)
-    await msg.reply(f"✅ Image count set to {count}")
+    await msg.reply(f"✅ Highlight count set to {count}")
 
 # ---------------- VIDEO ----------------
 @bot.on_message(filters.video)
-async def video_handler(_, msg):
+async def handle_video(_, msg):
     user_id = str(msg.from_user.id)
     max_images = get_count(msg.from_user.id)
 
-    status = await msg.reply("⬇️ Downloading video...")
+    await msg.reply("⬇️ Downloading video…")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
-    tasks[user_id] = {
-        "video": video_path,
-        "frame": 0,
-        "images": [],
-        "max": max_images,
-        "status": "processing"
-    }
-    save_tasks()
+    save_task(
+        user_id,
+        video_path,
+        0,
+        [],
+        max_images,
+        "processing"
+    )
 
-    await process_video(user_id, msg, status)
+    await process_video(user_id, msg.chat.id)
 
 # ---------------- PROCESS VIDEO ----------------
-async def process_video(user_id, msg, status):
-    task = tasks[user_id]
-    cap = cv2.VideoCapture(task["video"])
-    cap.set(cv2.CAP_PROP_POS_FRAMES, task["frame"])
+async def process_video(user_id, chat_id):
+    task = get_task(user_id)
+    if not task:
+        return
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total // (task["max"] * 3))
+    cap = cv2.VideoCapture(task["video_path"])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, task["last_frame"])
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, total_frames // (task["max_images"] * 3))
+
+    saved_images = task["saved_images"]
+    saved_count = len(saved_images)
     prev_gray = None
+    frame_no = task["last_frame"]
+
+    await bot.send_message(
+        chat_id,
+        f"🎞 Processing resumed\n📸 {saved_count}/{task['max_images']}"
+    )
+
+    start_time = time.time()
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        task["frame"] += 1
-        if task["frame"] % step != 0:
+        frame_no += 1
+        if frame_no % step != 0:
             continue
 
-        # Resize for Render
+        # Render-safe resize
         h, w, _ = frame.shape
         if w > 1280:
             scale = 1280 / w
-            frame = cv2.resize(
-                frame,
-                (1280, int(h * scale)),
-                interpolation=cv2.INTER_AREA
-            )
+            frame = cv2.resize(frame, (1280, int(h * scale)))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # Face score
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60,60))
-        face_score = sum(150 if 0.02 < (fw*fh)/(h*w) < 0.2 else 80 for (_,_,fw,fh) in faces)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+        score = 0
+        for (x, y, fw, fh) in faces:
+            ratio = (fw * fh) / (gray.shape[0] * gray.shape[1])
+            score += 150 if 0.02 < ratio < 0.2 else 80
+            if y < gray.shape[0] * 0.4:
+                score += 50
 
-        # Motion score
-        motion = 0
+        # Motion
         if prev_gray is not None:
-            motion = int(np.sum(cv2.absdiff(prev_gray, gray)) / 1_000_000)
+            diff = cv2.absdiff(prev_gray, gray)
+            score += int(np.sum(diff) / 1_000_000)
         prev_gray = gray
 
         # Sharpness
-        sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
-        sharp_score = 20 if sharp > 120 else 0
+        if cv2.Laplacian(gray, cv2.CV_64F).var() > 120:
+            score += 20
 
-        if face_score + motion + sharp_score > 120:
-            img_path = f"{FRAME_DIR}/{user_id}_{len(task['images'])}.jpg"
+        if score > 120:
+            img_path = f"{FRAME_DIR}/{user_id}_{saved_count}.jpg"
             cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            task["images"].append(img_path)
-            save_tasks()
+            saved_images.append(img_path)
+            saved_count += 1
 
-            progress = int((task["frame"] / total) * 100)
-            await status.edit(
-                f"📸 {len(task['images'])}/{task['max']} images\n⏳ {progress}%"
+            save_task(
+                user_id,
+                task["video_path"],
+                frame_no,
+                saved_images,
+                task["max_images"],
+                "processing"
             )
 
-        if len(task["images"]) >= task["max"]:
-            break
-
-        # Auto pause before Render kills process
-        if len(task["images"]) >= 180:
-            await status.edit("⚠️ Server busy. Auto-resume enabled.")
-            task["status"] = "paused"
-            save_tasks()
+        # Server protection (auto-pause)
+        if saved_count >= 180 or time.time() - start_time > 20:
+            save_task(
+                user_id,
+                task["video_path"],
+                frame_no,
+                saved_images,
+                task["max_images"],
+                "paused"
+            )
             cap.release()
             return
 
+        if saved_count >= task["max_images"]:
+            break
+
     cap.release()
 
-    if not task["images"]:
-        task["status"] = "done"
-        save_tasks()
-        await status.edit("❌ No highlights found")
-        return
+    # Create PDF
+    first = Image.open(saved_images[0]).convert("RGB")
+    rest = [Image.open(p).convert("RGB") for p in saved_images[1:]]
 
-    # ---------------- PDF ----------------
-    await status.edit("📄 Creating PDF...")
-    imgs = [Image.open(p).convert("RGB") for p in task["images"]]
     pdf_path = f"{OUTPUT_DIR}/{user_id}_highlights.pdf"
-    imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], resolution=150)
+    first.save(pdf_path, save_all=True, append_images=rest, resolution=150)
 
-    await msg.reply_document(
+    await bot.send_document(
+        chat_id,
         pdf_path,
-        caption=f"✅ {len(imgs)} highlights\n🧍 Face + body"
+        caption=f"✅ {saved_count} highlights\n📄 PDF ready"
     )
 
-    task["status"] = "done"
-    save_tasks()
+    save_task(
+        user_id,
+        task["video_path"],
+        frame_no,
+        [],
+        task["max_images"],
+        "done"
+    )
 
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
 
 # ---------------- AUTO RESUME ----------------
 async def resume_tasks():
-    for uid, task in tasks.items():
-        if task["status"] in ("processing", "paused"):
-            try:
-                await bot.send_message(int(uid), "🔄 Resuming your previous task...")
-                dummy = await bot.get_messages(int(uid), 1)
-                await process_video(uid, dummy, await bot.send_message(int(uid), "▶️ Resumed"))
-            except Exception as e:
-                print("Resume failed:", uid, e)
+    for task in get_pending_tasks():
+        await bot.send_message(
+            int(task["user_id"]),
+            "⚙️ Server restarted. Resuming your project automatically…"
+        )
+        await process_video(task["user_id"], int(task["user_id"]))
