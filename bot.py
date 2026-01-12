@@ -1,7 +1,7 @@
 import os
 import cv2
-import shutil
 import zipfile
+import shutil
 import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
@@ -33,7 +33,7 @@ async def start(_, msg):
         "✨ Face-priority highlights\n"
         "🧍 Full frame (face + body)\n"
         "📦 Output: ZIP\n\n"
-        "⚙ /settings <count> (max 200)"
+        "⚙ /settings <1-200>"
     )
 
 # ---------------- SETTINGS ----------------
@@ -46,13 +46,13 @@ async def settings(_, msg):
     count = int(msg.command[1])
 
     if count < 1 or count > 200:
-        await msg.reply("❌ Render limit: 1–200 images only")
+        await msg.reply("❌ Render limit: max 200 images")
         return
 
     set_count(msg.from_user.id, count)
-    await msg.reply(f"✅ Highlight count set to {count}")
+    await msg.reply(f"✅ Image count set to {count}")
 
-# ---------------- VIDEO ----------------
+# ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
@@ -71,6 +71,7 @@ async def video_handler(_, msg):
 
     await status.edit("🎞 Scanning video…")
 
+    # -------- PASS 1: SCORE FRAMES (NO RAM STORAGE) --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -80,7 +81,6 @@ async def video_handler(_, msg):
         if frame_no % step != 0:
             continue
 
-        # ---- Resize ----
         h, w, _ = frame.shape
         if w > 1280:
             scale = 1280 / w
@@ -92,7 +92,7 @@ async def video_handler(_, msg):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # ---- Face score ----
+        # Face score
         faces = face_cascade.detectMultiScale(
             gray, 1.2, 5, minSize=(60, 60)
         )
@@ -104,55 +104,84 @@ async def video_handler(_, msg):
             if y < gray.shape[0] * 0.4:
                 face_score += 40
 
-        # ---- Motion ----
+        # Motion score
         motion = 0
         if prev_gray is not None:
             diff = cv2.absdiff(prev_gray, gray)
             motion = int(np.sum(diff) / 1_000_000)
         prev_gray = gray
 
-        # ---- Sharpness ----
+        # Sharpness
         sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
         sharp_score = 20 if sharp > 120 else 0
 
         total_score = face_score + motion + sharp_score
 
-        scored_frames.append((total_score, frame.copy()))
+        scored_frames.append((total_score, frame_no))
 
     cap.release()
 
     if not scored_frames:
-        await status.edit("❌ No frames detected")
+        await status.edit("❌ No highlights found")
         return
 
     # -------- SELECT EXACT COUNT --------
     scored_frames.sort(key=lambda x: x[0], reverse=True)
-    selected = scored_frames[:target_count]
+    selected_frames = sorted(
+        [fno for _, fno in scored_frames[:target_count]]
+    )
 
-    await status.edit("📸 Saving images…")
+    # -------- PASS 2: EXTRACT FRAMES --------
+    cap = cv2.VideoCapture(video_path)
+    current = 0
+    saved = 0
 
-    image_paths = []
-    for i, (_, frame) in enumerate(selected):
-        path = f"{FRAME_DIR}/{user_id}_{i}.jpg"
+    await status.edit("📸 Extracting highlights…")
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        current += 1
+        if current not in selected_frames:
+            continue
+
+        h, w, _ = frame.shape
+        if w > 1280:
+            scale = 1280 / w
+            frame = cv2.resize(
+                frame,
+                (1280, int(h * scale)),
+                interpolation=cv2.INTER_AREA
+            )
+
+        img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
         cv2.imwrite(
-            path,
+            img_path,
             frame,
             [cv2.IMWRITE_JPEG_QUALITY, 90]
         )
-        image_paths.append(path)
+        saved += 1
 
-    # -------- CREATE ZIP --------
+        if saved >= target_count:
+            break
+
+    cap.release()
+
+    # -------- ZIP CREATION --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for img in image_paths:
-            zipf.write(img, arcname=os.path.basename(img))
+        for i in range(saved):
+            path = f"{FRAME_DIR}/{user_id}_{i}.jpg"
+            zipf.write(path, arcname=os.path.basename(path))
 
     await msg.reply_document(
         zip_path,
         caption=(
             f"✅ Highlights extracted\n"
-            f"📸 Images: {len(image_paths)}\n"
-            "🧍 Face + body\n"
+            f"📸 Images: {saved}\n"
+            "🧍 Face-priority (full frame)\n"
             "📦 ZIP format"
         )
     )
