@@ -7,6 +7,7 @@ from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
 
+# ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
@@ -14,10 +15,15 @@ OUTPUT_DIR = "output"
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
+# ---------------- DETECTORS ----------------
 face_cascade = cv2.CascadeClassifier(
     "haarcascade_frontalface_default.xml"
 )
 
+hog = cv2.HOGDescriptor()
+hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+# ---------------- BOT ----------------
 bot = Client(
     "highlight_bot",
     api_id=API_ID,
@@ -25,30 +31,55 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ---------------- START ----------------
+# ---------------- HELPERS ----------------
+def scene_change_score(prev_frame, frame):
+    if prev_frame is None:
+        return 0
+    h1 = cv2.calcHist([prev_frame], [0], None, [64], [0, 256])
+    h2 = cv2.calcHist([frame], [0], None, [64], [0, 256])
+    cv2.normalize(h1, h1)
+    cv2.normalize(h2, h2)
+    return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
+
+def motion_score(prev_gray, gray):
+    if prev_gray is None:
+        return 0
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, gray,
+        None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    return int(np.mean(mag) * 30)
+
+def body_score(frame):
+    boxes, _ = hog.detectMultiScale(
+        frame, winStride=(8, 8),
+        padding=(16, 16), scale=1.05
+    )
+    score = 0
+    h, w, _ = frame.shape
+    for (x, y, bw, bh) in boxes:
+        ratio = (bw * bh) / (w * h)
+        score += 150 if ratio > 0.15 else 80
+    return score
+
+# ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
         "🎬 Send a video\n\n"
-        "✨ Face-priority highlights\n"
-        "🧍 Full frame (face + body)\n"
+        "✨ Scene + Motion + Face + Body detection\n"
         "📦 Output: ZIP\n\n"
         "⚙ /settings <1-200>"
     )
 
-# ---------------- SETTINGS ----------------
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
     if len(msg.command) < 2:
-        await msg.reply("Usage: /settings <1-200>")
-        return
-
+        return await msg.reply("Usage: /settings <1-200>")
     count = int(msg.command[1])
-
     if count < 1 or count > 200:
-        await msg.reply("❌ Render limit: max 200 images")
-        return
-
+        return await msg.reply("❌ Max 200 (Render limit)")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
@@ -56,138 +87,104 @@ async def settings(_, msg):
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
-    target_count = get_count(user_id)
+    target = get_count(user_id)
 
-    status = await msg.reply("⬇️ Downloading video...")
+    status = await msg.reply("⬇️ Downloading video…")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, total_frames // (target * 4))
 
-    step = max(1, total_frames // (target_count * 4))
     frame_no = 0
     prev_gray = None
-    scored_frames = []
+    prev_color = None
+    scores = []
 
-    await status.edit("🎞 Scanning video…")
+    await status.edit("🎞 Analysing video…")
 
-    # -------- PASS 1: SCORE FRAMES (NO RAM STORAGE) --------
+    # -------- PASS 1 (SCORING ONLY) --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame_no += 1
         if frame_no % step != 0:
             continue
 
-        h, w, _ = frame.shape
-        if w > 1280:
-            scale = 1280 / w
+        if frame.shape[1] > 1280:
+            scale = 1280 / frame.shape[1]
             frame = cv2.resize(
-                frame,
-                (1280, int(h * scale)),
-                interpolation=cv2.INTER_AREA
+                frame, (1280, int(frame.shape[0] * scale))
             )
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Face score
-        faces = face_cascade.detectMultiScale(
-            gray, 1.2, 5, minSize=(60, 60)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        face_score = len(faces) * 120
+
+        total = (
+            face_score * 1.2 +
+            body_score(frame) * 1.3 +
+            motion_score(prev_gray, gray) * 1.0 +
+            scene_change_score(prev_color, frame) * 1.5
         )
 
-        face_score = 0
-        for (x, y, fw, fh) in faces:
-            ratio = (fw * fh) / (gray.shape[0] * gray.shape[1])
-            face_score += 120 if 0.02 < ratio < 0.2 else 60
-            if y < gray.shape[0] * 0.4:
-                face_score += 40
-
-        # Motion score
-        motion = 0
-        if prev_gray is not None:
-            diff = cv2.absdiff(prev_gray, gray)
-            motion = int(np.sum(diff) / 1_000_000)
+        scores.append((total, frame_no))
         prev_gray = gray
-
-        # Sharpness
-        sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
-        sharp_score = 20 if sharp > 120 else 0
-
-        total_score = face_score + motion + sharp_score
-
-        scored_frames.append((total_score, frame_no))
+        prev_color = frame
 
     cap.release()
 
-    if not scored_frames:
-        await status.edit("❌ No highlights found")
-        return
+    scores.sort(reverse=True)
+    selected = sorted([f for _, f in scores[:target]])
 
-    # -------- SELECT EXACT COUNT --------
-    scored_frames.sort(key=lambda x: x[0], reverse=True)
-    selected_frames = sorted(
-        [fno for _, fno in scored_frames[:target_count]]
-    )
-
-    # -------- PASS 2: EXTRACT FRAMES --------
+    # -------- PASS 2 (EXTRACT) --------
     cap = cv2.VideoCapture(video_path)
     current = 0
     saved = 0
 
-    await status.edit("📸 Extracting highlights…")
+    await status.edit("📸 Extracting frames…")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         current += 1
-        if current not in selected_frames:
+        if current not in selected:
             continue
 
-        h, w, _ = frame.shape
-        if w > 1280:
-            scale = 1280 / w
+        if frame.shape[1] > 1280:
+            scale = 1280 / frame.shape[1]
             frame = cv2.resize(
-                frame,
-                (1280, int(h * scale)),
-                interpolation=cv2.INTER_AREA
+                frame, (1280, int(frame.shape[0] * scale))
             )
 
-        img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
         cv2.imwrite(
-            img_path,
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 90]
+            f"{FRAME_DIR}/{user_id}_{saved}.jpg",
+            frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
         )
         saved += 1
-
-        if saved >= target_count:
+        if saved >= target:
             break
 
     cap.release()
 
-    # -------- ZIP CREATION --------
+    # -------- ZIP --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for i in range(saved):
-            path = f"{FRAME_DIR}/{user_id}_{i}.jpg"
-            zipf.write(path, arcname=os.path.basename(path))
+            z.write(
+                f"{FRAME_DIR}/{user_id}_{i}.jpg",
+                arcname=f"{i+1}.jpg"
+            )
 
     await msg.reply_document(
         zip_path,
-        caption=(
-            f"✅ Highlights extracted\n"
-            f"📸 Images: {saved}\n"
-            "🧍 Face-priority (full frame)\n"
-            "📦 ZIP format"
-        )
+        caption=f"✅ Highlights: {saved}\n📦 ZIP file"
     )
 
     await status.edit("✅ Done")
 
-    # -------- CLEANUP --------
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
