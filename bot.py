@@ -6,11 +6,14 @@ import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
+from nsfw import nsfw_score   # 🔥 ADD NSFW SUPPORT
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
+
+MAX_LIMIT = 200   # Render hard limit
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
@@ -68,7 +71,7 @@ def body_score(frame):
 async def start(_, msg):
     await msg.reply(
         "🎬 Send a video\n\n"
-        "✨ Scene + Motion + Face + Body detection\n"
+        "✨ Scene + Motion + Face + Body + NSFW detection\n"
         "📦 Output: ZIP\n\n"
         "⚙ /settings <1-200>"
     )
@@ -78,7 +81,7 @@ async def settings(_, msg):
     if len(msg.command) < 2:
         return await msg.reply("Usage: /settings <1-200>")
     count = int(msg.command[1])
-    if count < 1 or count > 200:
+    if count < 1 or count > MAX_LIMIT:
         return await msg.reply("❌ Max 200 (Render limit)")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
@@ -87,14 +90,16 @@ async def settings(_, msg):
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
-    target = get_count(user_id)
+    target = min(get_count(user_id), MAX_LIMIT)
 
     status = await msg.reply("⬇️ Downloading video…")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // (target * 4))
+
+    # 🔥 IMPORTANT FIX: step calculation
+    step = max(1, total_frames // (target * 3))
 
     frame_no = 0
     prev_gray = None
@@ -108,6 +113,7 @@ async def video_handler(_, msg):
         ret, frame = cap.read()
         if not ret:
             break
+
         frame_no += 1
         if frame_no % step != 0:
             continue
@@ -123,11 +129,14 @@ async def video_handler(_, msg):
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
         face_score = len(faces) * 120
 
+        nsfw = nsfw_score(frame, faces)
+
         total = (
             face_score * 1.2 +
             body_score(frame) * 1.3 +
             motion_score(prev_gray, gray) * 1.0 +
-            scene_change_score(prev_color, frame) * 1.5
+            scene_change_score(prev_color, frame) * 1.5 +
+            nsfw * 1.6            # 🔥 NSFW PRIORITY
         )
 
         scores.append((total, frame_no))
@@ -136,8 +145,12 @@ async def video_handler(_, msg):
 
     cap.release()
 
+    # 🔥 Ensure enough frames exist
     scores.sort(reverse=True)
     selected = sorted([f for _, f in scores[:target]])
+
+    if not selected:
+        return await status.edit("❌ No highlights detected")
 
     # -------- PASS 2 (EXTRACT) --------
     cap = cv2.VideoCapture(video_path)
@@ -150,6 +163,7 @@ async def video_handler(_, msg):
         ret, frame = cap.read()
         if not ret:
             break
+
         current += 1
         if current not in selected:
             continue
@@ -162,8 +176,10 @@ async def video_handler(_, msg):
 
         cv2.imwrite(
             f"{FRAME_DIR}/{user_id}_{saved}.jpg",
-            frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 95]  # 🔥 HIGH QUALITY
         )
+
         saved += 1
         if saved >= target:
             break
@@ -181,7 +197,7 @@ async def video_handler(_, msg):
 
     await msg.reply_document(
         zip_path,
-        caption=f"✅ Highlights: {saved}\n📦 ZIP file"
+        caption=f"✅ Highlights extracted\n📸 Images: {saved}"
     )
 
     await status.edit("✅ Done")
