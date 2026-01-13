@@ -1,5 +1,5 @@
 # user_settings.py
-user_settings = {}
+_user_settings = {}
 
 DEFAULT_COUNT = 25
 MAX_LIMIT = 200
