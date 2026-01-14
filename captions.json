@@ -23,5 +23,10 @@
     "Adult-oriented scene detected",
     "Mature content frame",
     "Sensitive scene extracted"
+  ],
+  "adult_scene": [
+    "Explicit adult scene detected",
+    "Adult content in this frame",
+    "Sensitive adult imagery"
   ]
 }
