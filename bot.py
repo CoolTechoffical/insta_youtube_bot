@@ -1,6 +1,5 @@
 import os
 import cv2
-import zipfile
 import shutil
 import numpy as np
 from flask import Flask
@@ -9,8 +8,10 @@ from threading import Thread
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
-from nsfw import nsfw_scene_score       # 🔥 Your NSFW module
-from caption_engine import get_caption  # Captions from JSON
+from nsfw import nsfw_scene_score
+from caption_engine import get_caption
+from pdf_exporter import images_to_pdf
+
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
@@ -36,11 +37,11 @@ bot = Client(
 )
 
 # ---------------- HELPERS ----------------
-def scene_change_score(prev_frame, frame):
-    if prev_frame is None:
+def scene_change_score(prev, cur):
+    if prev is None:
         return 0
-    h1 = cv2.calcHist([prev_frame], [0], None, [64], [0, 256])
-    h2 = cv2.calcHist([frame], [0], None, [64], [0, 256])
+    h1 = cv2.calcHist([prev], [0], None, [64], [0, 256])
+    h2 = cv2.calcHist([cur], [0], None, [64], [0, 256])
     cv2.normalize(h1, h1)
     cv2.normalize(h2, h2)
     return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
@@ -50,18 +51,28 @@ def body_score(frame):
                                     padding=(16, 16), scale=1.05)
     score = 0
     h, w, _ = frame.shape
-    for (x, y, bw, bh) in boxes:
+    for (_, _, bw, bh) in boxes:
         ratio = (bw * bh) / (w * h)
-        score += 150 if ratio > 0.15 else 80
+        score += 200 if ratio > 0.15 else 100
     return score
+
+def fluid_motion(prev_gray, gray):
+    if prev_gray is None:
+        return 0
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    return int(np.mean(mag) * 120)
 
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 Send a video\n"
-        "✨ Scene + Motion + Face + Body + NSFW detection\n"
-        "📦 Output: ZIP + captions\n"
+        "🎬 Send a video\n\n"
+        "🔥 NSFW + Pose + Motion detection\n"
+        "🧠 Smart captions\n"
+        "📄 Output: PDF with captions\n\n"
         "⚙ /settings <1-200>"
     )
 
@@ -71,7 +82,7 @@ async def settings(_, msg):
         return await msg.reply("Usage: /settings <1-200>")
     count = int(msg.command[1])
     if count < 1 or count > MAX_LIMIT:
-        return await msg.reply(f"❌ Max {MAX_LIMIT} (Render limit)")
+        return await msg.reply(f"❌ Max {MAX_LIMIT}")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
@@ -88,55 +99,55 @@ async def video_handler(_, msg):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, total_frames // (target * 3))
 
+    scores = []
     frame_no = 0
     prev_gray = None
     prev_color = None
-    scores = []
 
     await status.edit("🎞 Analysing video…")
 
-    # -------- PASS 1: SCORING --------
+    # -------- PASS 1: SCORE --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
         frame_no += 1
         if frame_no % step != 0:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
 
-        faces = face_cascade.detectMultiScale(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5
-        )
-
-        face_score = len(faces) * 120
-        nsfw_score_val, gray = nsfw_scene_score(frame, faces, prev_gray)
+        nsfw_val, gray_out = nsfw_scene_score(frame, faces, prev_gray)
+        motion_val = fluid_motion(prev_gray, gray)
+        body_val = body_score(frame)
 
         total = (
-            face_score*1.2 +
-            body_score(frame)*1.3 +
-            nsfw_score_val*1.6 +
-            scene_change_score(prev_color, frame)*1.5
+            nsfw_val * 1.8 +
+            motion_val * 1.4 +
+            body_val * 1.2 +
+            len(faces) * 150 +
+            scene_change_score(prev_color, frame) * 1.2
         )
+
         scores.append((total, frame_no))
-        prev_gray = gray
+        prev_gray = gray_out
         prev_color = frame
 
     cap.release()
     scores.sort(reverse=True)
     selected = sorted([f for _, f in scores[:target]])
+
     if not selected:
         return await status.edit("❌ No highlights detected")
 
-    # -------- PASS 2: EXTRACT --------
+    # -------- PASS 2: EXTRACT + CAPTION --------
     cap = cv2.VideoCapture(video_path)
     current = saved = 0
     prev_gray = None
-    await status.edit("📸 Extracting frames…")
+    pdf_data = []
+
+    await status.edit("📸 Extracting highlights…")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -146,29 +157,29 @@ async def video_handler(_, msg):
         if current not in selected:
             continue
 
-        faces = face_cascade.detectMultiScale(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5
-        )
-        nsfw_val, gray = nsfw_scene_score(frame, faces, prev_gray)
-        prev_gray = gray
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        nsfw_val, gray_out = nsfw_scene_score(frame, faces, prev_gray)
+        motion_val = fluid_motion(prev_gray, gray)
+        prev_gray = gray_out
 
-        # Tags for captions
         tags = []
         if nsfw_val > 700:
             tags.append("adult_scene")
-        elif nsfw_val > 500:
+        elif nsfw_val > 450:
             tags.append("intimate_pose")
         elif nsfw_val > 300:
             tags.append("suggestive")
+        if motion_val > 200:
+            tags.append("high_motion")
+        if body_score(frame) > 250:
+            tags.append("pose_lower")
 
         caption = get_caption(tags)
 
         img_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
-        txt_path = f"{FRAME_DIR}/{user_id}_{saved}.txt"
-
         cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        with open(txt_path, "w") as f:
-            f.write(caption)
+        pdf_data.append((img_path, caption))
 
         saved += 1
         if saved >= target:
@@ -176,14 +187,15 @@ async def video_handler(_, msg):
 
     cap.release()
 
-    # -------- ZIP OUTPUT --------
-    zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for i in range(saved):
-            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", f"{i+1}.jpg")
-            z.write(f"{FRAME_DIR}/{user_id}_{i}.txt", f"{i+1}.txt")
+    # -------- PDF OUTPUT --------
+    pdf_path = f"{OUTPUT_DIR}/{user_id}_highlights.pdf"
+    images_to_pdf(pdf_data, pdf_path)
 
-    await msg.reply_document(zip_path, caption=f"✅ {saved} images with captions")
+    await msg.reply_document(
+        pdf_path,
+        caption=f"📄 Highlights PDF\n📸 Images: {saved}"
+    )
+
     await status.edit("✅ Done")
 
     shutil.rmtree(FRAME_DIR)
