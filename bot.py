@@ -3,20 +3,20 @@ import cv2
 import zipfile
 import shutil
 import numpy as np
-from flask import Flask, request
+from flask import Flask
 from threading import Thread
 
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
-from nsfw import nsfw_score         # Your NSFW detector
+from nsfw import nsfw_scene_score       # 🔥 Your NSFW module
 from caption_engine import get_caption  # Captions from JSON
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
-MAX_LIMIT = 200   # Render limit
+MAX_LIMIT = 200
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
@@ -44,14 +44,6 @@ def scene_change_score(prev_frame, frame):
     cv2.normalize(h1, h1)
     cv2.normalize(h2, h2)
     return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
-
-def motion_score(prev_gray, gray):
-    if prev_gray is None:
-        return 0
-    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray,
-                                        None, 0.5, 3, 15, 3, 5, 1.2, 0)
-    mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
-    return int(np.mean(mag) * 30)
 
 def body_score(frame):
     boxes, _ = hog.detectMultiScale(frame, winStride=(8, 8),
@@ -117,25 +109,24 @@ async def video_handler(_, msg):
             scale = 1280 / frame.shape[1]
             frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        faces = face_cascade.detectMultiScale(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5
+        )
 
         face_score = len(faces) * 120
-        nsfw = nsfw_score(frame, faces)
+        nsfw_score_val, gray = nsfw_scene_score(frame, faces, prev_gray)
 
         total = (
             face_score*1.2 +
             body_score(frame)*1.3 +
-            motion_score(prev_gray, gray)*1.0 +
-            scene_change_score(prev_color, frame)*1.5 +
-            nsfw*1.6
+            nsfw_score_val*1.6 +
+            scene_change_score(prev_color, frame)*1.5
         )
         scores.append((total, frame_no))
         prev_gray = gray
         prev_color = frame
 
     cap.release()
-
     scores.sort(reverse=True)
     selected = sorted([f for _, f in scores[:target]])
     if not selected:
@@ -155,14 +146,13 @@ async def video_handler(_, msg):
         if current not in selected:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
+        faces = face_cascade.detectMultiScale(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.2, 5
+        )
+        nsfw_val, gray = nsfw_scene_score(frame, faces, prev_gray)
+        prev_gray = gray
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
-        nsfw_val = nsfw_score(frame, faces)
-
+        # Tags for captions
         tags = []
         if nsfw_val > 700:
             tags.append("adult_scene")
