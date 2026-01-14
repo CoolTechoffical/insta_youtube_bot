@@ -1,0 +1,27 @@
+{
+  "kissing": [
+    "A romantic moment between two people",
+    "An intimate kiss captured in the scene",
+    "Close emotional connection between partners"
+  ],
+  "intimate_pose": [
+    "Two people sharing an intimate pose",
+    "Romantic body language detected",
+    "A sensual and private moment"
+  ],
+  "suggestive": [
+    "Suggestive posture detected",
+    "Adult-oriented visual scene",
+    "Mature themed content"
+  ],
+  "nudity_detected": [
+    "Partial nudity detected in the scene",
+    "Minimal clothing observed",
+    "Sensitive visual content identified"
+  ],
+  "default": [
+    "Adult-oriented scene detected",
+    "Mature content frame",
+    "Sensitive scene extracted"
+  ]
+}
