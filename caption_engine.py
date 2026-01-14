@@ -1,11 +1,22 @@
 import json
+import os
 import random
 
-with open("captions.json", "r") as f:
-    CAPTIONS = json.load(f)
+CAPTIONS_FILE = "captions.json"
 
-def generate_caption(tags):
+if os.path.exists(CAPTIONS_FILE):
+    with open(CAPTIONS_FILE, "r") as f:
+        captions_dict = json.load(f)
+else:
+    captions_dict = {
+        "adult_scene": ["Explicit adult scene detected"],
+        "intimate_pose": ["Intimate pose detected"],
+        "suggestive": ["Suggestive content detected"],
+        "default": ["Highlight frame"]
+    }
+
+def get_caption(tags):
     for tag in tags:
-        if tag in CAPTIONS:
-            return random.choice(CAPTIONS[tag])
-    return random.choice(CAPTIONS["default"])
+        if tag in captions_dict:
+            return random.choice(captions_dict[tag])
+    return random.choice(captions_dict["default"])
