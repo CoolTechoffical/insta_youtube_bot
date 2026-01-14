@@ -11,7 +11,7 @@ from user_settings import set_count, get_count
 from nsfw import nsfw_scene_score
 from caption_engine import get_caption
 from pdf_exporter import images_to_pdf
-
+from pose_detector import detect_body_pose
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
