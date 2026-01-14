@@ -1,22 +1,30 @@
+# caption_engine.py
 import json
-import os
 import random
+import os
 
-CAPTIONS_FILE = "captions.json"
+CAPTION_FILE = "captions.json"
 
-if os.path.exists(CAPTIONS_FILE):
-    with open(CAPTIONS_FILE, "r") as f:
-        captions_dict = json.load(f)
-else:
-    captions_dict = {
-        "adult_scene": ["Explicit adult scene detected"],
-        "intimate_pose": ["Intimate pose detected"],
-        "suggestive": ["Suggestive content detected"],
-        "default": ["Highlight frame"]
-    }
+if not os.path.exists(CAPTION_FILE):
+    raise FileNotFoundError("captions.json not found")
 
-def get_caption(tags):
+with open(CAPTION_FILE, "r", encoding="utf-8") as f:
+    CAPTIONS = json.load(f)
+
+
+def get_caption(tags: list[str]) -> str:
+    """
+    Returns caption ONLY if tag matches detected content
+    """
+    matched = []
+
     for tag in tags:
-        if tag in captions_dict:
-            return random.choice(captions_dict[tag])
-    return random.choice(captions_dict["default"])
+        if tag in CAPTIONS:
+            matched.extend(CAPTIONS[tag])
+
+    if not matched:
+        return random.choice(
+            CAPTIONS.get("safe", ["Scene detected"])
+        )
+
+    return random.choice(matched)
