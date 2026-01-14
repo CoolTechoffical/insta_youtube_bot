@@ -47,8 +47,10 @@ def scene_change_score(prev, cur):
     return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
 
 def body_score(frame):
-    boxes, _ = hog.detectMultiScale(frame, winStride=(8, 8),
-                                    padding=(16, 16), scale=1.05)
+    boxes, _ = hog.detectMultiScale(
+        frame, winStride=(8, 8),
+        padding=(16, 16), scale=1.05
+    )
     score = 0
     h, w, _ = frame.shape
     for (_, _, bw, bh) in boxes:
@@ -159,21 +161,64 @@ async def video_handler(_, msg):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+
         nsfw_val, gray_out = nsfw_scene_score(frame, faces, prev_gray)
         motion_val = fluid_motion(prev_gray, gray)
         prev_gray = gray_out
 
+        # ---------------- TAGS ----------------
         tags = []
-        if nsfw_val > 700:
+
+        if nsfw_val > 900:
             tags.append("adult_scene")
-        elif nsfw_val > 450:
+        elif nsfw_val > 700:
             tags.append("intimate_pose")
-        elif nsfw_val > 300:
+        elif nsfw_val > 400:
             tags.append("suggestive")
-        if motion_val > 200:
-            tags.append("high_motion")
-        if body_score(frame) > 250:
-            tags.append("pose_lower")
+
+        if len(faces) >= 2 and nsfw_val > 650:
+            tags.extend(["kissing", "lips"])
+
+        if nsfw_val > 600:
+            tags.extend(["upper_body_exposed", "breasts", "tits"])
+
+        if nsfw_val > 750:
+            tags.extend(["lower_body_exposed", "butts"])
+
+        if nsfw_val > 780:
+            tags.extend(["big_boobs", "breast_kissing"])
+
+        if nsfw_val > 820:
+            tags.extend(["breast_sex", "drinking_breastmilk"])
+
+        if nsfw_val > 800:
+            tags.extend(["intercourse", "vaginal_sex"])
+
+        if nsfw_val > 830:
+            tags.extend(["oral_play", "blowjob", "pussy_eating"])
+
+        if nsfw_val > 860:
+            tags.extend(["handjob", "erotic_touch"])
+
+        if nsfw_val > 880:
+            tags.append("anal")
+
+        if nsfw_val > 870:
+            tags.append("cums")
+
+        if nsfw_val > 900:
+            tags.extend(["hot_cum", "squirting"])
+
+        if nsfw_val > 910 and len(faces) >= 3:
+            tags.append("threesome")
+
+        if motion_val > 300:
+            tags.append("intense_motion")
+        elif motion_val > 180:
+            tags.append("slow_motion")
+
+        if not tags:
+            tags.append("safe")
 
         caption = get_caption(tags)
 
