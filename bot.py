@@ -12,9 +12,6 @@ from nsfw import nsfw_scene_score
 from pose_detector import detect_body_pose
 from pdf_exporter import images_to_pdf
 
-
-Thread(target=run_flask, daemon=True).start()
-
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
