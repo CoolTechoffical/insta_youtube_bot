@@ -1,9 +1,7 @@
-# user_settings.py
+user_limits = {}
 
-USER_LIMITS = {}
+def set_count(uid, count):
+    user_limits[uid] = count
 
-def set_count(user_id: int, count: int):
-    USER_LIMITS[user_id] = count
-
-def get_count(user_id: int):
-    return USER_LIMITS.get(user_id, 30)  # default 30 images
+def get_count(uid):
+    return user_limits.get(uid, 30)
