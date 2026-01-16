@@ -1,9 +1,9 @@
-user_settings = {}
+# user_settings.py
 
-def get_user(user_id):
-    if user_id not in user_settings:
-        user_settings[user_id] = {
-            "count": 25,
-            "nsfw": True
-        }
-    return user_settings[user_id]
+USER_LIMITS = {}
+
+def set_count(user_id: int, count: int):
+    USER_LIMITS[user_id] = count
+
+def get_count(user_id: int):
+    return USER_LIMITS.get(user_id, 30)  # default 30 images
