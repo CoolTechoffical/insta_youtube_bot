@@ -6,20 +6,20 @@ import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import set_count, get_count
-from nsfw import nsfw_scene_score   # FIXED import
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
-MAX_LIMIT = 200
+
+MAX_LIMIT = 120   # 🔥 SAFE FOR RENDER
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
 # ---------------- DETECTORS ----------------
 face_cascade = cv2.CascadeClassifier(
-    "haarcascade_frontalface_default.xml"
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
 hog = cv2.HOGDescriptor()
@@ -34,79 +34,87 @@ bot = Client(
 )
 
 # ---------------- HELPERS ----------------
-def scene_change_score(prev, cur):
-    if prev is None:
-        return 0
-    h1 = cv2.calcHist([prev], [0], None, [64], [0, 256])
-    h2 = cv2.calcHist([cur], [0], None, [64], [0, 256])
-    cv2.normalize(h1, h1)
-    cv2.normalize(h2, h2)
-    return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
-
 def motion_score(prev_gray, gray):
     if prev_gray is None:
         return 0
     flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray,
-        None, 0.5, 3, 15, 3, 5, 1.2, 0
+        prev_gray, gray, None,
+        0.5, 2, 10, 2, 3, 1.1, 0
     )
     mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-    return int(np.mean(mag) * 40)
+    return int(np.mean(mag) * 20)
 
-def body_score(frame):
-    boxes, _ = hog.detectMultiScale(
-        frame, winStride=(8, 8),
-        padding=(16, 16), scale=1.05
-    )
-    score = 0
+def scene_change_score(prev, cur):
+    if prev is None:
+        return 0
+    h1 = cv2.calcHist([prev], [0], None, [64], [0,256])
+    h2 = cv2.calcHist([cur], [0], None, [64], [0,256])
+    cv2.normalize(h1, h1)
+    cv2.normalize(h2, h2)
+    return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 120)
+
+def pose_body_score(frame):
     h, w, _ = frame.shape
-    for (_, _, bw, bh) in boxes:
-        ratio = (bw * bh) / (w * h)
-        score += 150 if ratio > 0.15 else 80
-    return score
-
-# ---------------- POSE DETECTION (MERGED) ----------------
-def detect_body_pose(frame):
-    h, w, _ = frame.shape
-    boxes, _ = hog.detectMultiScale(frame, (8, 8), (16, 16), 1.05)
-
+    boxes, _ = hog.detectMultiScale(frame, (8,8), (16,16), 1.05)
     score = 0
-    for (x, y, bw, bh) in boxes:
-        ratio = bh / max(bw, 1)
 
-        if bh > h * 0.65:
+    for (x,y,bw,bh) in boxes:
+        ratio = bh / max(bw,1)
+        area = (bw*bh)/(w*h)
+
+        if area > 0.2:
             score += 120
-        if y < h * 0.35:
-            score += 80
-        if ratio < 1.2:
-            score += 90
-        if ratio > 2.4:
-            score += 60
+        if ratio < 1.3:
+            score += 90   # lying / intimate
+        if ratio > 2.3:
+            score += 60   # standing
 
     if len(boxes) >= 2:
-        score += 150
+        score += 180     # intimate proximity
 
-    return min(score, 300)
+    return min(score, 350)
+
+def nsfw_score(frame, faces, prev_gray):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    skin = cv2.inRange(hsv, (0,30,50), (25,255,255))
+    skin_ratio = cv2.countNonZero(skin)/(frame.shape[0]*frame.shape[1])
+
+    proximity = 0
+    if len(faces) >= 2:
+        for i in range(len(faces)):
+            for j in range(i+1, len(faces)):
+                x1,y1,w1,_ = faces[i]
+                x2,y2,w2,_ = faces[j]
+                if abs(x1-x2) < (w1+w2)*0.6:
+                    proximity += 200
+
+    motion = motion_score(prev_gray, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+
+    score = (
+        skin_ratio * 300 +
+        proximity * 1.1 +
+        motion * 0.7
+    )
+
+    return int(min(score, 900))
 
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 Send a video\n\n"
-        "👁 Face + Pose + Motion + Body + NSFW\n"
-        "📦 Output: ZIP\n\n"
-        "⚙ /settings <1-200>"
+        "🎬 Send video\n"
+        "🔥 Smart Pose + Body + Motion + Face + NSFW detection\n"
+        "📦 Output: ZIP\n"
+        "⚙ /settings <1-120>"
     )
 
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
     if len(msg.command) < 2:
-        return await msg.reply("Usage: /settings <1-200>")
-
+        return await msg.reply("Usage: /settings <1-120>")
     count = int(msg.command[1])
     if count < 1 or count > MAX_LIMIT:
-        return await msg.reply("❌ Max 200 (Render limit)")
-
+        return await msg.reply("❌ Max 120 (Render safe)")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
@@ -116,21 +124,20 @@ async def video_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
 
-    status = await msg.reply("⬇️ Downloading video…")
+    status = await msg.reply("⬇️ Downloading…")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total_frames // (target * 3))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    step = max(1, total // (target * 3))
 
-    frame_no = 0
-    prev_gray = None
-    prev_color = None
     scores = []
+    prev_gray = None
+    prev_frame = None
+    frame_no = 0
 
     await status.edit("🎞 Analysing video…")
 
-    # -------- PASS 1: SCORING --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -140,81 +147,61 @@ async def video_handler(_, msg):
         if frame_no % step != 0:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
+        if frame.shape[1] > 960:
+            scale = 960/frame.shape[1]
+            frame = cv2.resize(frame,(960,int(frame.shape[0]*scale)))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
+        faces = face_cascade.detectMultiScale(gray,1.2,5)
 
-        nsfw_val, gray_out, _ = nsfw_scene_score(frame, faces, prev_gray)
-        pose_val = detect_body_pose(frame)
-
-        total = (
-            len(faces) * 120 +
-            body_score(frame) * 1.2 +
+        total_score = (
+            pose_body_score(frame) * 1.3 +
             motion_score(prev_gray, gray) * 1.0 +
-            scene_change_score(prev_color, frame) * 1.4 +
-            pose_val * 1.3 +
-            nsfw_val * 1.6
+            scene_change_score(prev_frame, frame) * 1.4 +
+            nsfw_score(frame, faces, prev_gray) * 1.5
         )
 
-        scores.append((total, frame_no))
-        prev_gray = gray_out
-        prev_color = frame
+        scores.append((total_score, frame_no))
+        prev_gray = gray
+        prev_frame = frame
 
     cap.release()
 
+    if not scores:
+        return await status.edit("❌ No analyzable frames")
+
     scores.sort(reverse=True)
-    selected = sorted([f for _, f in scores[:target]])
+    selected = sorted([f for _,f in scores[:target]])
 
-    if not selected:
-        return await status.edit("❌ No highlights detected")
-
-    # -------- PASS 2: EXTRACT --------
     cap = cv2.VideoCapture(video_path)
-    current = 0
     saved = 0
+    cur = 0
 
-    await status.edit("📸 Extracting frames…")
+    await status.edit("📸 Extracting…")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-
-        current += 1
-        if current not in selected:
+        cur += 1
+        if cur not in selected:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
-
-        cv2.imwrite(
-            f"{FRAME_DIR}/{user_id}_{saved}.jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-
+        cv2.imwrite(f"{FRAME_DIR}/{user_id}_{saved}.jpg", frame)
         saved += 1
         if saved >= target:
             break
 
     cap.release()
 
-    # -------- ZIP OUTPUT --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
         for i in range(saved):
-            z.write(
-                f"{FRAME_DIR}/{user_id}_{i}.jpg",
-                arcname=f"{i+1}.jpg"
-            )
+            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", arcname=f"{i+1}.jpg")
 
     await msg.reply_document(
         zip_path,
-        caption=f"✅ Highlights extracted\n📸 Images: {saved}"
+        caption=f"✅ Extracted {saved} highlights"
     )
 
     await status.edit("✅ Done")
