@@ -1,7 +1,9 @@
-user_limits = {}
+user_settings = {}
 
-def set_count(uid, count):
-    user_limits[uid] = count
-
-def get_count(uid):
-    return user_limits.get(uid, 30)
+def get_user(user_id):
+    if user_id not in user_settings:
+        user_settings[user_id] = {
+            "count": 25,
+            "nsfw": True
+        }
+    return user_settings[user_id]
