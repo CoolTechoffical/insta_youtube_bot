@@ -5,7 +5,7 @@ import shutil
 import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
-from user_settings import set_count, get_count
+from user_settings import get_user
 from nsfw import nsfw_score   # 🔥 ADD NSFW SUPPORT
 
 # ---------------- PATHS ----------------
