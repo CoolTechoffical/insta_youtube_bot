@@ -8,7 +8,6 @@ from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_score
 
-# ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
@@ -18,7 +17,6 @@ MAX_LIMIT = 200
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
-# ---------------- DETECTORS ----------------
 face_cascade = cv2.CascadeClassifier(
     "haarcascade_frontalface_default.xml"
 )
@@ -26,7 +24,6 @@ face_cascade = cv2.CascadeClassifier(
 hog = cv2.HOGDescriptor()
 hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
-# ---------------- BOT ----------------
 bot = Client(
     "highlight_bot",
     api_id=API_ID,
@@ -34,7 +31,6 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-# ---------------- HELPERS ----------------
 def scene_change_score(prev_frame, frame):
     if prev_frame is None:
         return 0
@@ -66,15 +62,9 @@ def body_score(frame):
         score += 150 if ratio > 0.15 else 80
     return score
 
-# ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
-    await msg.reply(
-        "🎬 Send a video\n\n"
-        "✨ Scene + Motion + Face + Body + NSFW heuristics\n"
-        "📦 Output: ZIP\n"
-        "⚙ /settings <1-200>"
-    )
+    await msg.reply("🎬 Send video\n📦 Output ZIP\n⚙ /settings <1-200>")
 
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
@@ -86,18 +76,16 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
-# ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
 
-    status = await msg.reply("⬇️ Downloading video…")
+    status = await msg.reply("⬇️ Downloading…")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     step = max(1, total_frames // (target * 3))
 
     frame_no = 0
@@ -105,9 +93,8 @@ async def video_handler(_, msg):
     prev_color = None
     scores = []
 
-    await status.edit("🎞 Analysing video…")
+    await status.edit("🎞 Analysing…")
 
-    # -------- PASS 1 (SCORING) --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -131,7 +118,7 @@ async def video_handler(_, msg):
             body_score(frame) * 1.3 +
             motion_score(prev_gray, gray) * 1.0 +
             scene_change_score(prev_color, frame) * 1.5 +
-            nsfw_score(frame, faces, people, prev_color) * 1.6
+            nsfw_score(frame, faces, people, prev_color, prev_gray) * 1.6
         )
 
         scores.append((total, frame_no))
@@ -143,15 +130,11 @@ async def video_handler(_, msg):
     scores.sort(reverse=True)
     selected = sorted([f for _, f in scores[:target]])
 
-    if not selected:
-        return await status.edit("❌ No highlights detected")
-
-    # -------- PASS 2 (EXTRACT) --------
     cap = cv2.VideoCapture(video_path)
     current = 0
     saved = 0
 
-    await status.edit("📸 Extracting frames…")
+    await status.edit("📸 Extracting…")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -166,32 +149,19 @@ async def video_handler(_, msg):
             scale = 1280 / frame.shape[1]
             frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
 
-        cv2.imwrite(
-            f"{FRAME_DIR}/{user_id}_{saved}.jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-
+        cv2.imwrite(f"{FRAME_DIR}/{user_id}_{saved}.jpg", frame)
         saved += 1
         if saved >= target:
             break
 
     cap.release()
 
-    # -------- ZIP --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(zip_path, "w") as z:
         for i in range(saved):
-            z.write(
-                f"{FRAME_DIR}/{user_id}_{i}.jpg",
-                arcname=f"{i+1}.jpg"
-            )
+            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", f"{i+1}.jpg")
 
-    await msg.reply_document(
-        zip_path,
-        caption=f"✅ Highlights extracted\n📸 Images: {saved}"
-    )
-
+    await msg.reply_document(zip_path, caption=f"📸 Images: {saved}")
     await status.edit("✅ Done")
 
     shutil.rmtree(FRAME_DIR)
