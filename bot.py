@@ -12,23 +12,28 @@ from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_score
 
-# ---------------- PATHS ----------------
+
+# ================= CONFIG =================
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
-CLIP_DIR = "clips"
 
 MAX_LIMIT = 200
 
-for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR, CLIP_DIR):
+SCENE_BEFORE = 2     # seconds before highlight
+SCENE_AFTER = 2      # seconds after highlight
+MAX_SCENES = 20
+OUTPUT_RES = "720:-2"
+
+# =========================================
+
+for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
-# ---------------- GLOBAL CANCEL ----------------
 CANCEL_TASKS = set()
 
 # ---------------- DETECTORS ----------------
 face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
-
 hog = cv2.HOGDescriptor()
 hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
@@ -76,15 +81,73 @@ def body_score(frame):
         score += 150 if ratio > 0.15 else 80
     return score
 
-# ---------------- COMMANDS ----------------
+
+# ================= SCENE BUILDER =================
+def build_scenes(frames, fps):
+    scenes = []
+    for f in frames[:MAX_SCENES]:
+        start = max(0, (f / fps) - SCENE_BEFORE)
+        end = (f / fps) + SCENE_AFTER
+        scenes.append((start, end))
+
+    scenes.sort()
+    merged = []
+    for s, e in scenes:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return merged
+
+
+# ================= VIDEO EDITOR =================
+def create_edited_video(video_path, scenes, user_id):
+    parts = []
+    list_file = f"{OUTPUT_DIR}/{user_id}_list.txt"
+
+    with open(list_file, "w") as f:
+        for i, (start, end) in enumerate(scenes):
+            out = f"{OUTPUT_DIR}/{user_id}_part_{i}.mp4"
+            parts.append(out)
+
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-ss", str(start),
+                "-to", str(end),
+                "-vf", f"scale={OUTPUT_RES}",
+                "-preset", "veryfast",
+                out
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            f.write(f"file '{os.path.abspath(out)}'\n")
+
+    final = f"{OUTPUT_DIR}/{user_id}_edited.mp4"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        final
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for p in parts:
+        os.remove(p)
+    os.remove(list_file)
+
+    return final
+
+
+# ================= COMMANDS =================
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 **AI Highlight Bot**\n\n"
-        "Reply to a video with:\n"
-        "📸 `/extract` – Highlight images\n"
-        "✂ `/edit` – AI auto-cut video clips\n\n"
-        "⚙ `/settings <1-200>`"
+        "🎬 **AI Video Highlight Bot**\n\n"
+        "📸 /extract – Images\n"
+        "✂ /edit – Full edited video\n"
+        "⚙ /settings <1-200>\n\n"
+        "Reply command to a video"
     )
 
 @bot.on_message(filters.command("settings"))
@@ -97,35 +160,35 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
-# ---------------- CANCEL ----------------
 @bot.on_callback_query(filters.regex("^cancel_"))
 async def cancel_handler(_, cq):
     user_id = int(cq.data.split("_")[1])
     CANCEL_TASKS.add(user_id)
     await cq.answer("❌ Cancelled", show_alert=True)
 
-# ======================================================
-# =============== SHARED ANALYSIS LOGIC ================
-# ======================================================
+
+# ================= ANALYSIS CORE =================
 async def analyse_video(msg, status):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
 
-    video_path = await msg.reply_to_message.download(file_name=DOWNLOAD_DIR)
-    cap = cv2.VideoCapture(video_path)
+    video_path = await msg.reply_to_message.download(
+        file_name=f"{DOWNLOAD_DIR}/"
+    )
 
+    cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, total_frames // (target * 3))
 
-    frame_no = 0
     prev_gray = None
     prev_color = None
+    frame_no = 0
     scores = []
 
     while cap.isOpened():
         if user_id in CANCEL_TASKS:
             cap.release()
-            return None, video_path
+            return None, None
 
         ret, frame = cap.read()
         if not ret:
@@ -137,34 +200,30 @@ async def analyse_video(msg, status):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
-        people, _ = hog.detectMultiScale(frame)
 
-        score = (
-            len(faces) * 120 +
-            body_score(frame) +
+        total = (
+            len(faces) * 120 * 1.2 +
+            body_score(frame) * 1.3 +
             motion_score(prev_gray, gray) +
-            scene_change_score(prev_color, frame) +
-            nsfw_score(frame, faces, people, prev_color, prev_gray)
+            scene_change_score(prev_color, frame) * 1.5 +
+            nsfw_score(frame, faces) * 1.6
         )
 
-        scores.append((score, frame_no))
+        scores.append((total, frame_no))
         prev_gray = gray
         prev_color = frame
 
         if frame_no % (step * 5) == 0:
             bar = progress_bar(frame_no, total_frames)
-            percent = int((frame_no / total_frames) * 100)
-            await status.edit(f"🎞 Analysing…\n[{bar}] {percent}%")
+            await status.edit(f"🎞 Analysing\n[{bar}]")
 
     cap.release()
+
     scores.sort(reverse=True)
+    return [f for _, f in scores[:target]], video_path
 
-    frames = sorted([f for _, f in scores[:target]])
-    return frames, video_path
 
-# ======================================================
-# ================= /extract ===========================
-# ======================================================
+# ================= EXTRACT =================
 @bot.on_message(filters.command("extract") & filters.reply)
 async def extract(_, msg):
     user_id = msg.from_user.id
@@ -177,76 +236,73 @@ async def extract(_, msg):
         ])
     )
 
-    frames, video_path = await analyse_video(msg, status)
+    frames, video = await analyse_video(msg, status)
     if not frames:
         return await status.edit("❌ Cancelled")
 
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video)
     saved = 0
+    frames = set(frames)
 
-    for i, fno in enumerate(frames):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            continue
-
-        cv2.imwrite(f"{FRAME_DIR}/{user_id}_{i}.jpg", frame)
-        saved += 1
-
-        bar = progress_bar(saved, len(frames))
-        await status.edit(f"📸 Extracting…\n[{bar}]")
+            break
+        idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if idx in frames:
+            cv2.imwrite(f"{FRAME_DIR}/{saved}.jpg", frame)
+            saved += 1
+            await status.edit(
+                f"📸 Extracting\n[{progress_bar(saved, len(frames))}]"
+            )
 
     cap.release()
 
-    zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
+    zip_path = f"{OUTPUT_DIR}/{user_id}_images.zip"
     with zipfile.ZipFile(zip_path, "w") as z:
         for i in range(saved):
-            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", f"{i+1}.jpg")
+            z.write(f"{FRAME_DIR}/{i}.jpg", f"{i+1}.jpg")
 
-    await msg.reply_document(zip_path, caption=f"✅ {saved} images extracted")
+    await msg.reply_document(zip_path, caption=f"📸 {saved} images")
     await status.edit("✅ Done")
 
-# ======================================================
-# ================= /edit (AI AUTOCUT) =================
-# ======================================================
+    shutil.rmtree(FRAME_DIR)
+    os.makedirs(FRAME_DIR)
+
+
+# ================= EDIT =================
 @bot.on_message(filters.command("edit") & filters.reply)
 async def edit(_, msg):
     user_id = msg.from_user.id
     CANCEL_TASKS.discard(user_id)
 
     status = await msg.reply(
-        "⬇ Downloading video…",
+        "⬇ Downloading…",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
         ])
     )
 
-    frames, video_path = await analyse_video(msg, status)
+    frames, video = await analyse_video(msg, status)
     if not frames:
         return await status.edit("❌ Cancelled")
 
-    await status.edit("✂ Creating AI video clips…")
+    cap = cv2.VideoCapture(video)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
 
-    clips_sent = 0
-    fps = 30
+    scenes = build_scenes(frames, fps)
 
-    for i, fno in enumerate(frames[:10]):  # max 10 clips
-        start = max(0, fno - fps * 2)
-        duration = 4
+    await status.edit("✂ Editing video…")
+    final = create_edited_video(video, scenes, user_id)
 
-        out = f"{CLIP_DIR}/{user_id}_clip_{i}.mp4"
+    await msg.reply_document(
+        final,
+        caption=(
+            "✅ **AI Edited Video**\n"
+            f"🎞 Scenes kept: {len(scenes)}\n"
+            f"⏱ Avg duration: {SCENE_BEFORE + SCENE_AFTER}s"
+        )
+    )
 
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-ss", str(start / fps),
-            "-t", str(duration),
-            "-vf", "scale=720:-2",
-            "-preset", "veryfast",
-            out
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        await msg.reply_video(out, caption=f"🎬 AI Clip {i+1}")
-        clips_sent += 1
-
-    await status.edit(f"✅ {clips_sent} AI clips created")
+    await status.edit("✅ Editing completed")
