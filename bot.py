@@ -4,9 +4,11 @@ import zipfile
 import shutil
 import numpy as np
 import subprocess
+import asyncio
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait, MessageNotModified
 
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
@@ -24,7 +26,6 @@ SCENE_BEFORE = 2     # seconds before highlight
 SCENE_AFTER = 2      # seconds after highlight
 MAX_SCENES = 20
 OUTPUT_RES = "720:-2"
-
 # =========================================
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
@@ -44,6 +45,16 @@ bot = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# ---------------- SAFE MESSAGE EDIT ----------------
+async def safe_edit(msg, text):
+    try:
+        await msg.edit(text)
+    except MessageNotModified:
+        pass
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        await msg.edit(text)
 
 # ---------------- HELPERS ----------------
 def progress_bar(done, total, size=10):
@@ -144,10 +155,10 @@ def create_edited_video(video_path, scenes, user_id):
 async def start(_, msg):
     await msg.reply(
         "🎬 **AI Video Highlight Bot**\n\n"
-        "📸 /extract – Images\n"
-        "✂ /edit – Full edited video\n"
+        "📸 /extract – Extract images\n"
+        "✂ /edit – AI edited full video\n"
         "⚙ /settings <1-200>\n\n"
-        "Reply command to a video"
+        "Reply commands to a video"
     )
 
 @bot.on_message(filters.command("settings"))
@@ -184,6 +195,7 @@ async def analyse_video(msg, status):
     prev_color = None
     frame_no = 0
     scores = []
+    last_percent = -1
 
     while cap.isOpened():
         if user_id in CANCEL_TASKS:
@@ -213,9 +225,14 @@ async def analyse_video(msg, status):
         prev_gray = gray
         prev_color = frame
 
-        if frame_no % (step * 5) == 0:
+        percent = int((frame_no / total_frames) * 100)
+        if percent != last_percent:
+            last_percent = percent
             bar = progress_bar(frame_no, total_frames)
-            await status.edit(f"🎞 Analysing\n[{bar}]")
+            await safe_edit(
+                status,
+                f"🎞 Analysing video…\n[{bar}] {percent}%"
+            )
 
     cap.release()
 
@@ -238,23 +255,31 @@ async def extract(_, msg):
 
     frames, video = await analyse_video(msg, status)
     if not frames:
-        return await status.edit("❌ Cancelled")
+        return await safe_edit(status, "❌ Cancelled")
 
     cap = cv2.VideoCapture(video)
     saved = 0
     frames = set(frames)
+    last_percent = -1
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+
         idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
         if idx in frames:
             cv2.imwrite(f"{FRAME_DIR}/{saved}.jpg", frame)
             saved += 1
-            await status.edit(
-                f"📸 Extracting\n[{progress_bar(saved, len(frames))}]"
-            )
+
+            percent = int((saved / len(frames)) * 100)
+            if percent != last_percent:
+                last_percent = percent
+                await safe_edit(
+                    status,
+                    f"📸 Extracting images…\n"
+                    f"[{progress_bar(saved, len(frames))}] {percent}%"
+                )
 
     cap.release()
 
@@ -264,7 +289,7 @@ async def extract(_, msg):
             z.write(f"{FRAME_DIR}/{i}.jpg", f"{i+1}.jpg")
 
     await msg.reply_document(zip_path, caption=f"📸 {saved} images")
-    await status.edit("✅ Done")
+    await safe_edit(status, "✅ Done")
 
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR)
@@ -285,7 +310,7 @@ async def edit(_, msg):
 
     frames, video = await analyse_video(msg, status)
     if not frames:
-        return await status.edit("❌ Cancelled")
+        return await safe_edit(status, "❌ Cancelled")
 
     cap = cv2.VideoCapture(video)
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -293,7 +318,7 @@ async def edit(_, msg):
 
     scenes = build_scenes(frames, fps)
 
-    await status.edit("✂ Editing video…")
+    await safe_edit(status, "✂ Removing useless scenes…")
     final = create_edited_video(video, scenes, user_id)
 
     await msg.reply_document(
@@ -301,8 +326,8 @@ async def edit(_, msg):
         caption=(
             "✅ **AI Edited Video**\n"
             f"🎞 Scenes kept: {len(scenes)}\n"
-            f"⏱ Avg duration: {SCENE_BEFORE + SCENE_AFTER}s"
+            f"⏱ Scene duration: {SCENE_BEFORE + SCENE_AFTER}s"
         )
     )
 
-    await status.edit("✅ Editing completed")
+    await safe_edit(status, "✅ Editing completed")
