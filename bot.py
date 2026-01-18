@@ -4,10 +4,13 @@ import zipfile
 import shutil
 import numpy as np
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_score
 
+# ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
@@ -17,19 +20,29 @@ MAX_LIMIT = 200
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
-face_cascade = cv2.CascadeClassifier(
-    "haarcascade_frontalface_default.xml"
-)
+# ---------------- GLOBAL CANCEL TRACKER ----------------
+CANCEL_TASKS = set()
+
+# ---------------- DETECTORS ----------------
+face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
 
 hog = cv2.HOGDescriptor()
 hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
+# ---------------- BOT ----------------
 bot = Client(
     "highlight_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# ---------------- HELPERS ----------------
+def progress_bar(done, total, size=10):
+    if total == 0:
+        return "░" * size
+    filled = int(size * done / total)
+    return "█" * filled + "░" * (size - filled)
 
 def scene_change_score(prev_frame, frame):
     if prev_frame is None:
@@ -44,16 +57,14 @@ def motion_score(prev_gray, gray):
     if prev_gray is None:
         return 0
     flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray, None,
-        0.5, 3, 15, 3, 5, 1.2, 0
+        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
     )
     mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1])
     return int(np.mean(mag) * 30)
 
 def body_score(frame):
     boxes, _ = hog.detectMultiScale(
-        frame, winStride=(8,8),
-        padding=(16,16), scale=1.05
+        frame, winStride=(8,8), padding=(16,16), scale=1.05
     )
     score = 0
     h, w, _ = frame.shape
@@ -62,9 +73,15 @@ def body_score(frame):
         score += 150 if ratio > 0.15 else 80
     return score
 
+# ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
-    await msg.reply("🎬 Send video\n📦 Output ZIP\n⚙ /settings <1-200>")
+    await msg.reply(
+        "🎬 Send a video\n\n"
+        "✨ Smart highlight extraction\n"
+        "📦 Output: ZIP images\n"
+        "⚙ /settings <1-200>"
+    )
 
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
@@ -76,12 +93,28 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
+# ---------------- CANCEL HANDLER ----------------
+@bot.on_callback_query(filters.regex("^cancel_"))
+async def cancel_handler(_, cq):
+    user_id = int(cq.data.split("_")[1])
+    CANCEL_TASKS.add(user_id)
+    await cq.answer("❌ Processing cancelled", show_alert=True)
+
+# ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
 
-    status = await msg.reply("⬇️ Downloading…")
+    CANCEL_TASKS.discard(user_id)
+
+    status = await msg.reply(
+        "⬇️ Downloading video…",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
+        ])
+    )
+
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
     cap = cv2.VideoCapture(video_path)
@@ -93,9 +126,15 @@ async def video_handler(_, msg):
     prev_color = None
     scores = []
 
-    await status.edit("🎞 Analysing…")
+    await status.edit("🎞 Analysing video…")
 
+    # -------- PASS 1 (ANALYSIS) --------
     while cap.isOpened():
+        if user_id in CANCEL_TASKS:
+            CANCEL_TASKS.discard(user_id)
+            cap.release()
+            return await status.edit("❌ Analysis cancelled")
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -125,18 +164,32 @@ async def video_handler(_, msg):
         prev_gray = gray
         prev_color = frame
 
+        if frame_no % (step * 5) == 0:
+            bar = progress_bar(frame_no, total_frames)
+            percent = int((frame_no / total_frames) * 100)
+            await status.edit(f"🎞 Analysing…\n[{bar}] {percent}%")
+
     cap.release()
 
     scores.sort(reverse=True)
     selected = sorted([f for _, f in scores[:target]])
 
+    if not selected:
+        return await status.edit("❌ No highlights detected")
+
+    # -------- PASS 2 (EXTRACTION) --------
     cap = cv2.VideoCapture(video_path)
     current = 0
     saved = 0
 
-    await status.edit("📸 Extracting…")
+    await status.edit("📸 Extracting images…")
 
     while cap.isOpened():
+        if user_id in CANCEL_TASKS:
+            CANCEL_TASKS.discard(user_id)
+            cap.release()
+            return await status.edit("❌ Extraction cancelled")
+
         ret, frame = cap.read()
         if not ret:
             break
@@ -149,20 +202,36 @@ async def video_handler(_, msg):
             scale = 1280 / frame.shape[1]
             frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
 
-        cv2.imwrite(f"{FRAME_DIR}/{user_id}_{saved}.jpg", frame)
+        cv2.imwrite(
+            f"{FRAME_DIR}/{user_id}_{saved}.jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, 95]
+        )
+
         saved += 1
+
+        bar = progress_bar(saved, target)
+        percent = int((saved / target) * 100)
+        await status.edit(f"📸 Extracting…\n[{bar}] {percent}%")
+
         if saved >= target:
             break
 
     cap.release()
 
+    # -------- ZIP --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w") as z:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for i in range(saved):
-            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", f"{i+1}.jpg")
+            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", arcname=f"{i+1}.jpg")
 
-    await msg.reply_document(zip_path, caption=f"📸 Images: {saved}")
+    await msg.reply_document(
+        zip_path,
+        caption=f"✅ Highlights extracted\n📸 Images: {saved}"
+    )
+
     await status.edit("✅ Done")
 
     shutil.rmtree(FRAME_DIR)
     os.makedirs(FRAME_DIR, exist_ok=True)
+    CANCEL_TASKS.discard(user_id)
