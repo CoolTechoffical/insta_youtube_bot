@@ -3,6 +3,8 @@ import cv2
 import zipfile
 import shutil
 import numpy as np
+import subprocess
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -14,13 +16,14 @@ from nsfw import nsfw_score
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
+CLIP_DIR = "clips"
 
 MAX_LIMIT = 200
 
-for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
+for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR, CLIP_DIR):
     os.makedirs(d, exist_ok=True)
 
-# ---------------- GLOBAL CANCEL TRACKER ----------------
+# ---------------- GLOBAL CANCEL ----------------
 CANCEL_TASKS = set()
 
 # ---------------- DETECTORS ----------------
@@ -77,10 +80,11 @@ def body_score(frame):
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 Send a video\n\n"
-        "✨ Smart highlight extraction\n"
-        "📦 Output: ZIP images\n"
-        "⚙ /settings <1-200>"
+        "🎬 **AI Highlight Bot**\n\n"
+        "Reply to a video with:\n"
+        "📸 `/extract` – Highlight images\n"
+        "✂ `/edit` – AI auto-cut video clips\n\n"
+        "⚙ `/settings <1-200>`"
     )
 
 @bot.on_message(filters.command("settings"))
@@ -93,31 +97,23 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
-# ---------------- CANCEL HANDLER ----------------
+# ---------------- CANCEL ----------------
 @bot.on_callback_query(filters.regex("^cancel_"))
 async def cancel_handler(_, cq):
     user_id = int(cq.data.split("_")[1])
     CANCEL_TASKS.add(user_id)
-    await cq.answer("❌ Processing cancelled", show_alert=True)
+    await cq.answer("❌ Cancelled", show_alert=True)
 
-# ---------------- VIDEO HANDLER ----------------
-@bot.on_message(filters.video)
-async def video_handler(_, msg):
+# ======================================================
+# =============== SHARED ANALYSIS LOGIC ================
+# ======================================================
+async def analyse_video(msg, status):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
 
-    CANCEL_TASKS.discard(user_id)
-
-    status = await msg.reply(
-        "⬇️ Downloading video…",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
-        ])
-    )
-
-    video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
-
+    video_path = await msg.reply_to_message.download(file_name=DOWNLOAD_DIR)
     cap = cv2.VideoCapture(video_path)
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step = max(1, total_frames // (target * 3))
 
@@ -126,14 +122,10 @@ async def video_handler(_, msg):
     prev_color = None
     scores = []
 
-    await status.edit("🎞 Analysing video…")
-
-    # -------- PASS 1 (ANALYSIS) --------
     while cap.isOpened():
         if user_id in CANCEL_TASKS:
-            CANCEL_TASKS.discard(user_id)
             cap.release()
-            return await status.edit("❌ Analysis cancelled")
+            return None, video_path
 
         ret, frame = cap.read()
         if not ret:
@@ -143,24 +135,19 @@ async def video_handler(_, msg):
         if frame_no % step != 0:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
-        people, _ = hog.detectMultiScale(frame, winStride=(8,8))
+        people, _ = hog.detectMultiScale(frame)
 
-        total = (
-            len(faces) * 120 * 1.2 +
-            body_score(frame) * 1.3 +
-            motion_score(prev_gray, gray) * 1.0 +
-            scene_change_score(prev_color, frame) * 1.5 +
-            nsfw_score(frame, faces, people, prev_color, prev_gray) * 1.6
+        score = (
+            len(faces) * 120 +
+            body_score(frame) +
+            motion_score(prev_gray, gray) +
+            scene_change_score(prev_color, frame) +
+            nsfw_score(frame, faces, people, prev_color, prev_gray)
         )
 
-        scores.append((total, frame_no))
+        scores.append((score, frame_no))
         prev_gray = gray
         prev_color = frame
 
@@ -170,68 +157,96 @@ async def video_handler(_, msg):
             await status.edit(f"🎞 Analysing…\n[{bar}] {percent}%")
 
     cap.release()
-
     scores.sort(reverse=True)
-    selected = sorted([f for _, f in scores[:target]])
 
-    if not selected:
-        return await status.edit("❌ No highlights detected")
+    frames = sorted([f for _, f in scores[:target]])
+    return frames, video_path
 
-    # -------- PASS 2 (EXTRACTION) --------
+# ======================================================
+# ================= /extract ===========================
+# ======================================================
+@bot.on_message(filters.command("extract") & filters.reply)
+async def extract(_, msg):
+    user_id = msg.from_user.id
+    CANCEL_TASKS.discard(user_id)
+
+    status = await msg.reply(
+        "⬇ Downloading…",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
+        ])
+    )
+
+    frames, video_path = await analyse_video(msg, status)
+    if not frames:
+        return await status.edit("❌ Cancelled")
+
     cap = cv2.VideoCapture(video_path)
-    current = 0
     saved = 0
 
-    await status.edit("📸 Extracting images…")
-
-    while cap.isOpened():
-        if user_id in CANCEL_TASKS:
-            CANCEL_TASKS.discard(user_id)
-            cap.release()
-            return await status.edit("❌ Extraction cancelled")
-
+    for i, fno in enumerate(frames):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fno)
         ret, frame = cap.read()
         if not ret:
-            break
-
-        current += 1
-        if current not in selected:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0]*scale)))
-
-        cv2.imwrite(
-            f"{FRAME_DIR}/{user_id}_{saved}.jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-
+        cv2.imwrite(f"{FRAME_DIR}/{user_id}_{i}.jpg", frame)
         saved += 1
 
-        bar = progress_bar(saved, target)
-        percent = int((saved / target) * 100)
-        await status.edit(f"📸 Extracting…\n[{bar}] {percent}%")
-
-        if saved >= target:
-            break
+        bar = progress_bar(saved, len(frames))
+        await status.edit(f"📸 Extracting…\n[{bar}]")
 
     cap.release()
 
-    # -------- ZIP --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(zip_path, "w") as z:
         for i in range(saved):
-            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", arcname=f"{i+1}.jpg")
+            z.write(f"{FRAME_DIR}/{user_id}_{i}.jpg", f"{i+1}.jpg")
 
-    await msg.reply_document(
-        zip_path,
-        caption=f"✅ Highlights extracted\n📸 Images: {saved}"
-    )
-
+    await msg.reply_document(zip_path, caption=f"✅ {saved} images extracted")
     await status.edit("✅ Done")
 
-    shutil.rmtree(FRAME_DIR)
-    os.makedirs(FRAME_DIR, exist_ok=True)
+# ======================================================
+# ================= /edit (AI AUTOCUT) =================
+# ======================================================
+@bot.on_message(filters.command("edit") & filters.reply)
+async def edit(_, msg):
+    user_id = msg.from_user.id
     CANCEL_TASKS.discard(user_id)
+
+    status = await msg.reply(
+        "⬇ Downloading video…",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}")]
+        ])
+    )
+
+    frames, video_path = await analyse_video(msg, status)
+    if not frames:
+        return await status.edit("❌ Cancelled")
+
+    await status.edit("✂ Creating AI video clips…")
+
+    clips_sent = 0
+    fps = 30
+
+    for i, fno in enumerate(frames[:10]):  # max 10 clips
+        start = max(0, fno - fps * 2)
+        duration = 4
+
+        out = f"{CLIP_DIR}/{user_id}_clip_{i}.mp4"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-ss", str(start / fps),
+            "-t", str(duration),
+            "-vf", "scale=720:-2",
+            "-preset", "veryfast",
+            out
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        await msg.reply_video(out, caption=f"🎬 AI Clip {i+1}")
+        clips_sent += 1
+
+    await status.edit(f"✅ {clips_sent} AI clips created")
