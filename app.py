@@ -1,6 +1,6 @@
 import asyncio
 from flask import Flask
-from bot import BOT
+from bot import bot
 
 app = Flask(__name__)
 
