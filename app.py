@@ -10,5 +10,5 @@ def home():
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.create_task(BOT.start())
+    loop.create_task(bot.start())
     app.run(host="0.0.0.0", port=8080)
