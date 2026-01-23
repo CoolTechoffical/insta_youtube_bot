@@ -1,4 +1,4 @@
-import asyncio
+import os
 import threading
 from flask import Flask
 from bot import bot
@@ -10,13 +10,14 @@ def home():
     return "✅ AI Detector Bot is running!"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
-
-async def run_bot():
-    await bot.start()
-    print("🤖 Bot started successfully")
-    await asyncio.Event().wait()  # keep alive forever
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    print("🤖 Bot starting...")
+    print("🤖 Starting Flask + Bot...")
+
+    # Flask in background thread
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Pyrogram MUST run in main thread
     bot.run()
