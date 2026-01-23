@@ -18,9 +18,5 @@ async def run_bot():
     await asyncio.Event().wait()  # keep alive forever
 
 if __name__ == "__main__":
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.start()
-
-    # Start Pyrogram bot in asyncio loop
-    asyncio.run(run_bot())
+    print("🤖 Bot starting...")
+    bot.run()
