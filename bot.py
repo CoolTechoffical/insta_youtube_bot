@@ -33,7 +33,7 @@ async def image_handler(_, msg):
 
     await status.edit(
         f"🖼 **Image Result**\n\n"
-        f"🤖 AI Generated: **{result['is_ai']}**\n"
+        f"🤖 Classification: **{'AI' if result['is_ai'] else 'Real'}**\n"
         f"🧠 Tool: **{result['tool']}**\n"
         f"📊 Confidence: **{result['confidence']}%**\n\n"
         f"🧪 Signals:\n" +
