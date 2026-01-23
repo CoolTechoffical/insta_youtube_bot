@@ -5,7 +5,7 @@ from config import API_ID, API_HASH, BOT_TOKEN
 from detector import detect_image_ai, detect_video_ai
 
 bot = Client(
-    "ai_detector_bot",
+    "ai_detector",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
@@ -14,33 +14,34 @@ bot = Client(
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
         "🤖 **AI Image & Video Detector**\n\n"
-        "📸 Send an image or video\n"
-        "🧠 Detects REAL vs AI\n"
-        "🛠 Identifies AI tools (Gemini, Nano Banana, etc)\n\n"
-        "_Prediction based on metadata & heuristics_"
+        "📤 Send an image or video\n"
+        "🧠 Detects AI vs Real\n"
+        "🔍 Predicts AI tool\n\n"
+        "_Prediction only, not guaranteed._"
     )
+
 
 @bot.on_message(filters.photo)
 async def image_handler(_, msg):
-    status = await msg.reply("🔍 Scanning image...")
+    status = await msg.reply("🔍 Analyzing image...")
     path = await msg.download(DOWNLOAD_DIR)
 
     result = detect_image_ai(path)
 
     await status.edit(
         f"🖼 **Image Result**\n\n"
-        f"🤖 Classification: **{'AI' if result['is_ai'] else 'Real'}**\n"
+        f"🤖 AI Generated: **{result['is_ai']}**\n"
         f"🧠 Tool: **{result['tool']}**\n"
-        f"📊 Confidence: **{result['confidence']}%**\n\n"
-        f"🧪 Signals:\n" +
-        "\n".join(f"• {s}" for s in result["signals"])
+        f"📊 Confidence: **{result['confidence']}%**"
     )
 
     os.remove(path)
+
 
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
