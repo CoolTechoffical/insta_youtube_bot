@@ -14,7 +14,6 @@ bot = Client(
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
@@ -24,7 +23,6 @@ async def start(_, msg):
         "🔍 Predicts AI tool\n\n"
         "_Prediction only, not guaranteed._"
     )
-
 
 @bot.on_message(filters.photo)
 async def image_handler(_, msg):
@@ -41,7 +39,6 @@ async def image_handler(_, msg):
     )
 
     os.remove(path)
-
 
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
