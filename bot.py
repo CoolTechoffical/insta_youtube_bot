@@ -32,10 +32,12 @@ async def image_handler(_, msg):
     result = detect_image_ai(path)
 
     await status.edit(
-        f"🖼 **Image Result**\n\n"
+        f"🖼 **Image Scan Result**\n\n"
         f"🤖 AI Generated: **{result['is_ai']}**\n"
         f"🧠 Tool: **{result['tool']}**\n"
-        f"📊 Confidence: **{result['confidence']}%**"
+        f"📊 Confidence: **{result['confidence']}%**\n"
+        f"🆔 Synthetic ID: `{result['synthetic_id']}`\n\n"
+        f"🔍 Detection Signals:\n• " + "\n• ".join(result["signals"])
     )
 
     os.remove(path)
