@@ -6,7 +6,7 @@ import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
-from nsfw import nsfw_score   # 🔥 ADD NSFW SUPPORT
+from nsfw import nsfw_scene_score   # 🔥 ADD NSFW SUPPORT
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
