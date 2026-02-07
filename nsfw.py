@@ -1,155 +1,188 @@
 import cv2
 import numpy as np
 
-# ================= SKIN =================
+# =====================================================
+# SKIN DETECTION
+# =====================================================
 
 def skin_mask(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     lower = np.array([0, 30, 60], np.uint8)
-    upper = np.array([20, 150, 255], np.uint8)
+    upper = np.array([25, 150, 255], np.uint8)
     mask = cv2.inRange(hsv, lower, upper)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 def skin_ratio(frame):
-    if frame.size == 0:
-        return 0
     mask = skin_mask(frame)
     return cv2.countNonZero(mask) / (frame.shape[0] * frame.shape[1])
 
-# ================= LIPS / FACE PROXIMITY =================
 
-def lips_focus_score(faces, frame):
-    score = 0
-    for (x,y,w,h) in faces:
-        face = frame[y:y+h, x:x+w]
-        if face.size == 0:
-            continue
-        # lower face = lips / mouth zone
-        lips = face[int(h*0.55):int(h*0.75), int(w*0.2):int(w*0.8)]
-        if skin_ratio(lips) > 0.42:
-            score += 120
-    return score
+# =====================================================
+# FACE PROXIMITY (INTIMACY / KISSING-LIKE)
+# =====================================================
 
-def kissing_score(faces):
+def face_proximity_score(faces):
     if len(faces) < 2:
         return 0
+
     score = 0
-    for i in range(len(faces)):
-        for j in range(i+1, len(faces)):
-            x1,y1,w1,h1 = faces[i]
-            x2,y2,w2,h2 = faces[j]
-            c1 = (x1+w1//2, y1+h1//2)
-            c2 = (x2+w2//2, y2+h2//2)
-            dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
-            if dist < (w1+w2)/2 * 0.7:
+    centers = [(x + w // 2, y + h // 2, w) for (x, y, w, h) in faces]
+
+    for i in range(len(centers)):
+        for j in range(i + 1, len(centers)):
+            x1, y1, w1 = centers[i]
+            x2, y2, w2 = centers[j]
+            dist = ((x1 - x2)**2 + (y1 - y2)**2) ** 0.5
+            avg = (w1 + w2) / 2
+
+            if dist < avg * 0.6:
                 score += 180
+            elif dist < avg * 0.8:
+                score += 100
+
     return score
 
-# ================= BODY =================
+
+# =====================================================
+# BODY EXPOSURE (UPPER / LOWER REGIONS)
+# =====================================================
 
 def body_exposure_score(frame):
     h = frame.shape[0]
-    upper = frame[int(h*0.20):int(h*0.45)]
-    lower = frame[int(h*0.45):int(h*0.80)]
+
+    upper = frame[int(h * 0.20):int(h * 0.50)]
+    lower = frame[int(h * 0.50):int(h * 0.85)]
+
     score = 0
-    if skin_ratio(upper) > 0.33:
-        score += 140
-    if skin_ratio(lower) > 0.30:
-        score += 180
+    if skin_ratio(upper) > 0.30:
+        score += 150
+    if skin_ratio(lower) > 0.25:
+        score += 200
+
     return score
 
-# ================= CHEST / HIP =================
 
-def chest_hip_score(frame, people_boxes):
+# =====================================================
+# PERSON REGION ANALYSIS (HOG BOXES)
+# =====================================================
+
+def private_region_score(frame, people_boxes):
     score = 0
-    for (x,y,w,h) in people_boxes:
-        person = frame[y:y+h, x:x+w]
+
+    for (x, y, w, h) in people_boxes:
+        person = frame[y:y + h, x:x + w]
         if person.size == 0:
             continue
+
         ph = person.shape[0]
+        mid = person[int(ph * 0.45):int(ph * 0.65)]
+        low = person[int(ph * 0.65):int(ph * 0.90)]
 
-        chest = person[int(ph*0.25):int(ph*0.45)]
-        hips  = person[int(ph*0.60):int(ph*0.80)]
-
-        if skin_ratio(chest) > 0.36:
+        if skin_ratio(mid) > 0.35:
             score += 160
-        if skin_ratio(hips) > 0.34:
+        if skin_ratio(low) > 0.30:
             score += 220
+
     return score
 
-# ================= PRIVATE ZONE =================
 
-def private_zone_score(frame, people_boxes):
-    score = 0
-    for (x,y,w,h) in people_boxes:
-        person = frame[y:y+h, x:x+w]
-        if person.size == 0:
-            continue
-        ph = person.shape[0]
-        mid = person[int(ph*0.45):int(ph*0.65)]
-        low = person[int(ph*0.65):int(ph*0.90)]
+# =====================================================
+# MOTION / FLOW (RHYTHM / FLUID / WATER)
+# =====================================================
 
-        if skin_ratio(mid) > 0.38:
-            score += 180
-        if skin_ratio(low) > 0.32:
-            score += 240
-    return score
-
-# ================= FLUID / MOTION =================
-
-def fluid_flow_score(prev_gray, gray):
+def motion_flow(prev_gray, gray):
     flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+        prev_gray, gray,
+        None, 0.5, 3, 15, 3, 5, 1.2, 0
     )
-    mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
-    strong = mag > 2.0
-    if strong.sum() == 0:
-        return 0
-    if np.std(ang[strong]) < 0.9:
-        return int(np.mean(mag[strong]) * 35)
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    return mag, ang
+
+def rhythmic_motion_score(prev_gray, gray):
+    mag, _ = motion_flow(prev_gray, gray)
+    active = (mag > 1.5) & (mag < 4.5)
+    ratio = active.sum() / mag.size
+    if ratio > 0.12:
+        return min(260, int(ratio * 1600))
     return 0
 
-def fluid_spray_score(prev_gray, gray):
-    flow = cv2.calcOpticalFlowFarneback(
-        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
-    )
-    mag = np.sqrt(flow[...,0]**2 + flow[...,1]**2)
-    spray = mag > 3.5
-    return min(300, int(spray.sum() / 200))
+def fluid_motion_score(prev_gray, gray):
+    mag, ang = motion_flow(prev_gray, gray)
+    strong = mag > 2.5
+    if strong.sum() < 50:
+        return 0
+    if np.std(ang[strong]) > 1.4:
+        return min(250, int(np.mean(mag[strong]) * 45))
+    return 0
 
-def droplet_cluster_score(frame, prev_frame):
-    diff = cv2.absdiff(frame, prev_frame)
-    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, th = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    droplets = sum(1 for c in cnts if 8 < cv2.contourArea(c) < 120)
-    return min(250, droplets * 6)
+def wet_surface_score(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2]
+    s = hsv[:, :, 1]
 
-def fluid_trail_score(prev_gray, gray):
-    diff = cv2.absdiff(gray, prev_gray)
-    _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    return min(220, int(cv2.countNonZero(th) / 250))
+    wet = (v > 200) & (s < 70)
+    ratio = wet.sum() / (frame.shape[0] * frame.shape[1])
+    return min(200, int(ratio * 900))
 
-# ================= FINAL SCORE =================
 
-def nsfw_score(frame, faces, people_boxes=None, prev_frame=None, prev_gray=None):
+# =====================================================
+# CONTEXT INTENSITY (COMBINED SIGNALS)
+# =====================================================
+
+def intimacy_context_score(faces, skin_val, motion_val):
     score = 0
 
-    score += int(skin_ratio(frame) * 280)
-    score += kissing_score(faces)
-    score += lips_focus_score(faces, frame)
+    if len(faces) >= 2 and skin_val > 0.25:
+        score += 120
+
+    if motion_val > 120 and skin_val > 0.28:
+        score += 180
+
+    if len(faces) >= 2 and motion_val > 150:
+        score += 220
+
+    return score
+
+
+# =====================================================
+# FINAL NSFW SCORE (MAIN FUNCTION)
+# =====================================================
+
+def nsfw_scene_score(
+    frame,
+    faces,
+    people_boxes=None,
+    prev_frame=None,
+    prev_gray=None
+):
+    score = 0
+
+    # --- Skin ---
+    skin_val = skin_ratio(frame)
+    score += int(skin_val * 280)
+
+    # --- Faces ---
+    score += face_proximity_score(faces)
+
+    # --- Body ---
     score += body_exposure_score(frame)
 
     if people_boxes is not None:
-        score += chest_hip_score(frame, people_boxes)
-        score += private_zone_score(frame, people_boxes)
+        score += private_region_score(frame, people_boxes)
 
-    if prev_frame is not None and prev_gray is not None:
+    # --- Motion / Fluid / Water ---
+    motion_val = 0
+    if prev_gray is not None:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        score += fluid_flow_score(prev_gray, gray)
-        score += fluid_spray_score(prev_gray, gray)
-        score += droplet_cluster_score(frame, prev_frame)
-        score += fluid_trail_score(prev_gray, gray)
+        motion_val += rhythmic_motion_score(prev_gray, gray)
+        motion_val += fluid_motion_score(prev_gray, gray)
+        score += motion_val
+
+    if prev_frame is not None:
+        score += wet_surface_score(frame)
+
+    # --- Context Boost ---
+    score += intimacy_context_score(faces, skin_val, motion_val)
 
     return score
