@@ -6,14 +6,14 @@ import numpy as np
 from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
-from nsfw import nsfw_scene_score   # 🔥 ADD NSFW SUPPORT
+from nsfw import nsfw_scene_score   # ✅ CORRECT
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
 
-MAX_LIMIT = 200   # Render hard limit
+MAX_LIMIT = 200
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
@@ -64,15 +64,15 @@ def body_score(frame):
     for (x, y, bw, bh) in boxes:
         ratio = (bw * bh) / (w * h)
         score += 150 if ratio > 0.15 else 80
-    return score
+    return score, boxes
 
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
     await msg.reply(
-        "🎬 Send a video\n\n"
-        "✨ Scene + Motion + Face + Body + NSFW detection\n"
-        "📦 Output: ZIP\n\n"
+        "🎬 Send a video\n"
+        "✨ Scene + Motion + Body + NSFW\n"
+        "📦 Output: ZIP\n"
         "⚙ /settings <1-200>"
     )
 
@@ -82,7 +82,7 @@ async def settings(_, msg):
         return await msg.reply("Usage: /settings <1-200>")
     count = int(msg.command[1])
     if count < 1 or count > MAX_LIMIT:
-        return await msg.reply("❌ Max 200 (Render limit)")
+        return await msg.reply("❌ Max 200")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
 
@@ -98,61 +98,63 @@ async def video_handler(_, msg):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # 🔥 IMPORTANT FIX: step calculation
     step = max(1, total_frames // (target * 3))
 
-    frame_no = 0
+    frame_index = 0
     prev_gray = None
-    prev_color = None
-    scores = []
+    prev_frame = None
+    scored_frames = []
 
     await status.edit("🎞 Analysing video…")
 
-    # -------- PASS 1 (SCORING ONLY) --------
+    # -------- PASS 1 (SCORING) --------
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_no += 1
-        if frame_no % step != 0:
+        frame_index += 1
+        if frame_index % step != 0:
             continue
 
         if frame.shape[1] > 1280:
             scale = 1280 / frame.shape[1]
-            frame = cv2.resize(
-                frame, (1280, int(frame.shape[0] * scale))
-            )
+            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
-        face_score = len(faces) * 120
+        body_val, people_boxes = body_score(frame)
 
-        nsfw = nsfw_score(frame, faces)
-
-        total = (
-            face_score * 1.2 +
-            body_score(frame) * 1.3 +
-            motion_score(prev_gray, gray) * 1.0 +
-            scene_change_score(prev_color, frame) * 1.5 +
-            nsfw * 1.6            # 🔥 NSFW PRIORITY
+        nsfw = nsfw_scene_score(
+            frame,
+            faces,
+            people_boxes,
+            prev_frame,
+            prev_gray
         )
 
-        scores.append((total, frame_no))
+        total = (
+            len(faces) * 120 +
+            body_val * 1.3 +
+            motion_score(prev_gray, gray) * 1.2 +
+            scene_change_score(prev_frame, frame) * 1.4 +
+            nsfw * 1.6
+        )
+
+        scored_frames.append((total, frame_index))
         prev_gray = gray
-        prev_color = frame
+        prev_frame = frame
 
     cap.release()
 
-    # 🔥 Ensure enough frames exist
-    scores.sort(reverse=True)
-    selected = sorted([f for _, f in scores[:target]])
+    if not scored_frames:
+        return await status.edit("❌ No frames analyzed")
 
-    if not selected:
-        return await status.edit("❌ No highlights detected")
+    scored_frames.sort(reverse=True)
+    selected_frames = sorted([f for _, f in scored_frames[:target]])
+    selected_set = set(selected_frames)  # ✅ FAST LOOKUP
 
-    # -------- PASS 2 (EXTRACT) --------
+    # -------- PASS 2 (EXTRACTION) --------
     cap = cv2.VideoCapture(video_path)
     current = 0
     saved = 0
@@ -165,19 +167,17 @@ async def video_handler(_, msg):
             break
 
         current += 1
-        if current not in selected:
+        if current not in selected_set:
             continue
 
         if frame.shape[1] > 1280:
             scale = 1280 / frame.shape[1]
-            frame = cv2.resize(
-                frame, (1280, int(frame.shape[0] * scale))
-            )
+            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
 
         cv2.imwrite(
             f"{FRAME_DIR}/{user_id}_{saved}.jpg",
             frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]  # 🔥 HIGH QUALITY
+            [cv2.IMWRITE_JPEG_QUALITY, 95]
         )
 
         saved += 1
@@ -186,9 +186,12 @@ async def video_handler(_, msg):
 
     cap.release()
 
+    if saved == 0:
+        return await status.edit("❌ Extraction failed")
+
     # -------- ZIP --------
     zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(zip_path, "w") as z:
         for i in range(saved):
             z.write(
                 f"{FRAME_DIR}/{user_id}_{i}.jpg",
