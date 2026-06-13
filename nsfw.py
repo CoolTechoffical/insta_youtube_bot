@@ -268,7 +268,89 @@ def context_score(
         score += 100
 
     return score
+    
+def multi_person_score(people_boxes):
 
+    if people_boxes is None:
+        return 0
+
+    count = len(people_boxes)
+
+    if count >= 4:
+        return 250
+
+    if count >= 3:
+        return 180
+
+    if count >= 2:
+        return 100
+
+    return 0
+
+def full_frame_exposure_bonus(frame):
+
+    ratio = skin_ratio(frame)
+
+    if ratio > 0.60:
+        return 600
+
+    if ratio > 0.45:
+        return 350
+
+    if ratio > 0.30:
+        return 180
+
+    return 0
+
+def person_coverage_score(frame, people_boxes):
+
+    if people_boxes is None:
+        return 0
+
+    score = 0
+
+    for (x, y, w, h) in people_boxes:
+
+        person = frame[y:y+h, x:x+w]
+
+        if person.size == 0:
+            continue
+
+        ratio = skin_ratio(person)
+
+        if ratio > 0.50:
+            score += 450
+
+        elif ratio > 0.35:
+            score += 250
+
+        elif ratio > 0.20:
+            score += 120
+
+    return score
+
+def body_size_score(frame, people_boxes):
+
+    if people_boxes is None:
+        return 0
+
+    h, w = frame.shape[:2]
+
+    frame_area = h * w
+
+    score = 0
+
+    for (_, _, bw, bh) in people_boxes:
+
+        area_ratio = (bw * bh) / frame_area
+
+        if area_ratio > 0.35:
+            score += 220
+
+        elif area_ratio > 0.20:
+            score += 120
+
+    return score
 # =====================================================
 # FINAL NSFW SCORE
 # =====================================================
@@ -316,7 +398,20 @@ def nsfw_scene_score(
     # BODY CONTACT
     # -----------------------------------
 
-    score += contact_score(people_boxes)
+    score += multi_person_score(people_boxes)
+
+    score += full_frame_exposure_bonus(frame)
+
+    score += person_coverage_score(
+        frame,
+        people_boxes
+)
+
+    score += body_size_score(
+        frame,
+        people_boxes
+)
+
 
     # -----------------------------------
     # MOTION
@@ -359,7 +454,7 @@ def nsfw_scene_score(
     # -----------------------------------
 
     score = int(
-        max(0, min(score, 1500))
+        max(0, min(score, 3000))
     )
 
     return score
