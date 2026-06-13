@@ -7,6 +7,7 @@ from pyrogram import Client, filters
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_scene_score   # ✅ CORRECT
+from down import download_video_from_url
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
@@ -14,6 +15,7 @@ FRAME_DIR = "frames"
 OUTPUT_DIR = "output"
 
 MAX_LIMIT = 200
+URL_REGEX = r"^https?://"
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
@@ -85,6 +87,45 @@ async def settings(_, msg):
         return await msg.reply("❌ Max 200")
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to {count}")
+
+@bot.on_message(filters.command("url"))
+async def url_handler(_, msg):
+
+    if len(msg.command) < 2:
+        return await msg.reply(
+            "Usage:\n/url <video_url>"
+        )
+
+    url = msg.command[1].strip()
+
+    if not url.startswith(("http://", "https://")):
+        return await msg.reply(
+            "❌ Invalid URL"
+        )
+
+    status = await msg.reply(
+        "⬇️ Downloading video..."
+    )
+
+    try:
+
+        video_path = download_video_from_url(url)
+
+        if not os.path.exists(video_path):
+            return await status.edit(
+                "❌ Video not found after download"
+            )
+
+    except Exception as e:
+
+        return await status.edit(
+            f"❌ Download failed\n{str(e)}"
+        )
+
+    await status.edit(
+        "🎞 Processing video..."
+    )
+    
 
 # ---------------- VIDEO HANDLER ----------------
 @bot.on_message(filters.video)
