@@ -6,42 +6,39 @@ DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def download_video_from_url(url):
+    ydl_opts = {
+        "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
+        "quiet": True,
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        "restrictfilenames": True
+    }
 
-ydl_opts = {
-    "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-    "quiet": True,
-    "noplaylist": True,
-    "merge_output_format": "mp4",
-    "restrictfilenames": True
-}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(
+            url,
+            download=True
+        )
 
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        video_path = ydl.prepare_filename(info)
 
-    info = ydl.extract_info(
-        url,
-        download=True
-    )
+        if os.path.exists(video_path):
+            return video_path
 
-    video_path = ydl.prepare_filename(info)
+        base = os.path.splitext(video_path)[0]
 
-    if os.path.exists(video_path):
-        return video_path
+        for ext in (
+            ".mp4",
+            ".mkv",
+            ".webm",
+            ".mov",
+            ".avi"
+        ):
+            candidate = base + ext
 
-    base = os.path.splitext(video_path)[0]
+            if os.path.exists(candidate):
+                return candidate
 
-    for ext in (
-        ".mp4",
-        ".mkv",
-        ".webm",
-        ".mov",
-        ".avi"
-    ):
-
-        candidate = base + ext
-
-        if os.path.exists(candidate):
-            return candidate
-
-    raise FileNotFoundError(
-        "Downloaded file not found"
-    )
+        raise FileNotFoundError(
+            "Downloaded file not found"
+        )
