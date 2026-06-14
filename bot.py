@@ -72,8 +72,31 @@ async def process_video(video_path, user_id, target, status_msg):
     """Process video and return ZIP path or None"""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # EDIT 1: Check if video opened successfully
+    if not cap.isOpened():
+        return None
 
-    step = max(1, total_frames // (target * 3))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if fps <= 0:
+        cap.release()
+        return None
+
+    duration = total_frames / fps
+
+    if duration > 3600:
+        await status_msg.edit(
+            "❌ Video too long (max 60 minutes)"
+        )
+        cap.release()
+        return None
+
+    # EDIT 2: Modified step calculation
+    step = max(
+        15,
+        total_frames // max(target, 1)
+    )
 
     frame_index = 0
     prev_gray = None
@@ -89,12 +112,23 @@ async def process_video(video_path, user_id, target, status_msg):
             break
 
         frame_index += 1
+        
+        # EDIT 4: Progress update every 5000 frames
+        if frame_index % 5000 == 0:
+            try:
+                await status_msg.edit(
+                    f"🎞 Analysing...\n{frame_index}/{total_frames}"
+                )
+            except:
+                pass
+        
         if frame_index % step != 0:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
+        # EDIT 3: Changed resize from 1280 to 720
+        if frame.shape[1] > 720:
+            scale = 720 / frame.shape[1]
+            frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, 1.2, 5)
@@ -145,9 +179,10 @@ async def process_video(video_path, user_id, target, status_msg):
         if current not in selected_set:
             continue
 
-        if frame.shape[1] > 1280:
-            scale = 1280 / frame.shape[1]
-            frame = cv2.resize(frame, (1280, int(frame.shape[0] * scale)))
+        # EDIT 3: Changed resize from 1280 to 720
+        if frame.shape[1] > 720:
+            scale = 720 / frame.shape[1]
+            frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
 
         cv2.imwrite(
             f"{FRAME_DIR}/{user_id}_{saved}.jpg",
@@ -252,6 +287,12 @@ async def url_handler(_, msg):
                 f"📸 **Images:** {target}\n"
                 f"🎬 **Source:** {url[:50]}..."
     )
+    
+    # EDIT 5: Cleanup zip file after sending
+    try:
+        os.remove(zip_path)
+    except:
+        pass
 
     await status.edit("✅ **Done!** Check the ZIP file above.")
     
@@ -282,6 +323,12 @@ async def video_handler(_, msg):
                 f"📸 **Images:** {target}\n"
                 f"📹 **Source:** Telegram video"
     )
+    
+    # EDIT 5: Cleanup zip file after sending
+    try:
+        os.remove(zip_path)
+    except:
+        pass
 
     await status.edit("✅ **Done!** Check the ZIP file above.")
     
