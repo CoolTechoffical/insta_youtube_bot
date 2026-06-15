@@ -17,6 +17,9 @@ OUTPUT_DIR = "output"
 MAX_LIMIT = 200
 URL_REGEX = r"^https?://"
 
+# Cancel tasks dictionary
+cancel_tasks = {}
+
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
 
@@ -71,12 +74,12 @@ def body_score(frame):
 async def process_video(video_path, user_id, target, status_msg):
     """Process video and return ZIP path or None"""
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # EDIT 1: Check if video opened successfully
+    # Validate video opened successfully
     if not cap.isOpened():
         return None
-
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     if fps <= 0:
@@ -92,10 +95,10 @@ async def process_video(video_path, user_id, target, status_msg):
         cap.release()
         return None
 
-    # EDIT 2: Modified step calculation
+    # Better long video support - increased step size
     step = max(
-        15,
-        total_frames // max(target, 1)
+        20,
+        total_frames // max(target * 2, 1)
     )
 
     frame_index = 0
@@ -107,17 +110,24 @@ async def process_video(video_path, user_id, target, status_msg):
 
     # PASS 1 (SCORING)
     while cap.isOpened():
+        # Check for cancel command
+        if cancel_tasks.get(user_id):
+            cap.release()
+            await status_msg.edit("🛑 Cancelled by user.")
+            return None
+        
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_index += 1
         
-        # EDIT 4: Progress update every 5000 frames
+        # Progress update every 5000 frames
         if frame_index % 5000 == 0:
             try:
                 await status_msg.edit(
-                    f"🎞 Analysing...\n{frame_index}/{total_frames}"
+                    f"🎞 Analysing...\n"
+                    f"{frame_index}/{total_frames} frames"
                 )
             except:
                 pass
@@ -125,7 +135,7 @@ async def process_video(video_path, user_id, target, status_msg):
         if frame_index % step != 0:
             continue
 
-        # EDIT 3: Changed resize from 1280 to 720
+        # Smaller processing resolution - 720p
         if frame.shape[1] > 720:
             scale = 720 / frame.shape[1]
             frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
@@ -142,12 +152,13 @@ async def process_video(video_path, user_id, target, status_msg):
             prev_gray
         )
 
+        # Increased NSFW priority - NSFW weight increased from 1.6 to 3.0
         total = (
-            len(faces) * 120 +
-            body_val * 1.3 +
-            motion_score(prev_gray, gray) * 1.2 +
-            scene_change_score(prev_frame, frame) * 1.4 +
-            nsfw * 1.6
+            len(faces) * 80 +
+            body_val * 1.0 +
+            motion_score(prev_gray, gray) * 0.8 +
+            scene_change_score(prev_frame, frame) * 1.0 +
+            nsfw * 3.0  # NSFW priority significantly increased
         )
 
         scored_frames.append((total, frame_index))
@@ -171,6 +182,12 @@ async def process_video(video_path, user_id, target, status_msg):
     await status_msg.edit("📸 Extracting frames…")
 
     while cap.isOpened():
+        # Check for cancel command
+        if cancel_tasks.get(user_id):
+            cap.release()
+            await status_msg.edit("🛑 Cancelled by user.")
+            return None
+        
         ret, frame = cap.read()
         if not ret:
             break
@@ -179,7 +196,7 @@ async def process_video(video_path, user_id, target, status_msg):
         if current not in selected_set:
             continue
 
-        # EDIT 3: Changed resize from 1280 to 720
+        # Smaller processing resolution - 720p
         if frame.shape[1] > 720:
             scale = 720 / frame.shape[1]
             frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
@@ -224,10 +241,11 @@ async def start(_, msg):
         "• Scene detection\n"
         "• Motion analysis\n"
         "• Body detection\n"
-        "• NSFW filtering\n\n"
+        "• NSFW filtering (High Priority)\n\n"
         "⚙ **Commands:**\n"
         "/settings <1-200> - Set number of images\n"
-        "/url <video_url> - Process video from URL\n\n"
+        "/url <video_url> - Process video from URL\n"
+        "/cancel - Cancel current processing\n\n"
         "📦 **Output:** ZIP file with highlights"
     )
 
@@ -247,10 +265,19 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to **{count}**")
 
+@bot.on_message(filters.command("cancel"))
+async def cancel_handler(_, msg):
+    user_id = msg.from_user.id
+    cancel_tasks[user_id] = True
+    await msg.reply("🛑 Processing cancelled.")
+
 @bot.on_message(filters.command("url"))
 async def url_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
+    
+    # Reset cancel flag
+    cancel_tasks[user_id] = False
 
     if len(msg.command) < 2:
         return await msg.reply(
@@ -288,7 +315,7 @@ async def url_handler(_, msg):
                 f"🎬 **Source:** {url[:50]}..."
     )
     
-    # EDIT 5: Cleanup zip file after sending
+    # Clean ZIP after sending
     try:
         os.remove(zip_path)
     except:
@@ -306,6 +333,9 @@ async def url_handler(_, msg):
 async def video_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
+    
+    # Reset cancel flag
+    cancel_tasks[user_id] = False
 
     status = await msg.reply("⬇️ **Downloading video...**")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
@@ -324,7 +354,7 @@ async def video_handler(_, msg):
                 f"📹 **Source:** Telegram video"
     )
     
-    # EDIT 5: Cleanup zip file after sending
+    # Clean ZIP after sending
     try:
         os.remove(zip_path)
     except:
@@ -338,7 +368,7 @@ async def video_handler(_, msg):
     except:
         pass
 
-# ---------------- ERROR HANDLER ----------------
+# ---------------- HELP COMMAND ----------------
 @bot.on_message(filters.command("help"))
 async def help_command(_, msg):
     await msg.reply(
@@ -351,12 +381,16 @@ async def help_command(_, msg):
         "**Settings:**\n"
         "• `/settings 50` - Extract 50 images\n"
         "• Maximum: 200 images\n\n"
+        "**Cancel Processing:**\n"
+        "• Use `/cancel` to stop current processing\n\n"
         "**Features:**\n"
         "• Smart scene detection\n"
         "• Motion analysis\n"
         "• Face and body detection\n"
-        "• NSFW content filtering\n"
-        "• High-quality JPEG output\n\n"
+        "• NSFW content filtering (High Priority)\n"
+        "• High-quality JPEG output\n"
+        "• 720p processing for better performance\n"
+        "• Support for long videos\n\n"
         "**Support:**\n"
         "• Send /start to begin\n"
         "• Send /help for this menu"
