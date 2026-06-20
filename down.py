@@ -4,31 +4,18 @@ import yt_dlp
 DOWNLOAD_DIR = "downloads"
 
 # ============ CONFIGURABLE LIMITS ============
-# You can change these values based on your hosting
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (2048 MB)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
 MAX_DURATION = 7200  # 120 minutes (2 hours)
 
-# Warning thresholds (not rejections, just warnings)
-WARN_FILE_SIZE = 1.5 * 1024 * 1024 * 1024  # 1.5 GB - Show warning
-WARN_DURATION = 5400  # 90 minutes - Show warning
+# Warning thresholds
+WARN_FILE_SIZE = 1.5 * 1024 * 1024 * 1024  # 1.5 GB
+WARN_DURATION = 5400  # 90 minutes
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def download_video_from_url(url, status_callback=None, max_size=None, max_duration=None):
     """
     Download video from URL with configurable size and duration limits
-    
-    Args:
-        url: Video URL to download
-        status_callback: Optional async function to update status messages
-        max_size: Override MAX_FILE_SIZE (in bytes)
-        max_duration: Override MAX_DURATION (in seconds)
-    
-    Returns:
-        str: Path to downloaded video file
-    
-    Raises:
-        Exception: If video exceeds limits or download fails
     """
     
     # Use provided limits or defaults
@@ -40,8 +27,20 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
         with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            # Check file size
-            size = info.get("filesize") or info.get("filesize_approx")
+            # Get file size - try multiple methods
+            size = info.get("filesize")
+            if not size:
+                size = info.get("filesize_approx")
+            if not size:
+                # Try to get from formats
+                formats = info.get("formats", [])
+                for f in formats:
+                    if f.get("filesize"):
+                        size = f.get("filesize")
+                        break
+                    elif f.get("filesize_approx"):
+                        size = f.get("filesize_approx")
+                        break
             
             if size:
                 size_mb = round(size / (1024 * 1024), 2)
@@ -55,8 +54,8 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
                         f"⚠️ Please use a smaller video"
                     )
             else:
-                size_mb = None
-                size_gb = None
+                size_mb = "Unknown"
+                size_gb = "Unknown"
             
             # Check duration
             duration = info.get("duration", 0)
@@ -82,10 +81,10 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
             raise
         raise Exception(f"❌ Failed to get video info: {str(e)}")
 
-    # Prepare download options with chunked downloading for large files
+    # Prepare download options
     ydl_opts = {
         "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-        "quiet": True,
+        "quiet": False,  # Set to False for debugging
         "noplaylist": True,
         "merge_output_format": "mp4",
         "restrictfilenames": True,
@@ -103,10 +102,10 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
                 "Chrome/137.0 Safari/537.36"
             )
         },
-        # For large files, use chunked downloading
+        # For large files
         "fragment_retries": 10,
         "retries": 10,
-        "continuedl": True,  # Resume partial downloads
+        "continuedl": True,
         "progress_hooks": [lambda d: _progress_hook(d, status_callback)]
     }
 
@@ -134,9 +133,7 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
         raise Exception(f"❌ Download failed: {str(e)}")
 
 def _progress_hook(d, status_callback=None):
-    """
-    Progress hook for yt-dlp to track download progress
-    """
+    """Progress hook for yt-dlp"""
     if d["status"] == "downloading":
         try:
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
@@ -144,7 +141,6 @@ def _progress_hook(d, status_callback=None):
                 downloaded = d.get("downloaded_bytes", 0)
                 percent = round((downloaded / total) * 100, 1)
                 
-                # Calculate remaining time
                 speed = d.get("speed", 0)
                 if speed and speed > 0:
                     remaining = (total - downloaded) / speed
@@ -157,7 +153,7 @@ def _progress_hook(d, status_callback=None):
                 else:
                     time_text = "Unknown"
                 
-                # Log progress (for debugging)
+                # This is for debugging
                 # print(f"Download: {percent}% - {time_text} remaining")
                 
         except:
@@ -166,34 +162,45 @@ def _progress_hook(d, status_callback=None):
 def get_video_info(url, max_size=None, max_duration=None):
     """
     Get video information without downloading
-    
-    Args:
-        url: Video URL
-        max_size: Override MAX_FILE_SIZE
-        max_duration: Override MAX_DURATION
-    
-    Returns:
-        dict: Video information including size, duration, title, etc.
     """
     try:
         with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
             info = ydl.extract_info(url, download=False)
             
-            size = info.get("filesize") or info.get("filesize_approx")
+            # Try multiple ways to get file size
+            size = info.get("filesize")
+            if not size:
+                size = info.get("filesize_approx")
+            if not size:
+                # Check formats for size
+                formats = info.get("formats", [])
+                for f in formats:
+                    if f.get("filesize"):
+                        size = f.get("filesize")
+                        break
+                    elif f.get("filesize_approx"):
+                        size = f.get("filesize_approx")
+                        break
+            
             duration = info.get("duration", 0)
             
             # Use provided limits or defaults
             size_limit = max_size if max_size is not None else MAX_FILE_SIZE
             duration_limit = max_duration if max_duration is not None else MAX_DURATION
             
+            # Prepare size info
+            size_info = {
+                "bytes": size,
+                "mb": round(size / (1024 * 1024), 2) if size else "Unknown",
+                "gb": round(size / (1024 * 1024 * 1024), 2) if size else "Unknown"
+            }
+            
             return {
                 "title": info.get("title", "Unknown"),
                 "duration": duration,
                 "duration_minutes": round(duration / 60, 1),
                 "duration_hours": round(duration / 3600, 2),
-                "size": size,
-                "size_mb": round(size / (1024 * 1024), 2) if size else None,
-                "size_gb": round(size / (1024 * 1024 * 1024), 2) if size else None,
+                "size": size_info,
                 "is_valid": (
                     (size is None or size <= size_limit) and 
                     duration <= duration_limit
@@ -211,6 +218,7 @@ def get_video_info(url, max_size=None, max_duration=None):
                 "view_count": info.get("view_count", 0),
                 "like_count": info.get("like_count", 0),
                 "upload_date": info.get("upload_date", "Unknown"),
+                "extractor": info.get("extractor", "Unknown"),
             }
     except Exception as e:
         return {
@@ -221,15 +229,6 @@ def get_video_info(url, max_size=None, max_duration=None):
 async def download_with_status(url, status_msg, max_size=None, max_duration=None):
     """
     Download video with status updates
-    
-    Args:
-        url: Video URL
-        status_msg: Message object to update with status
-        max_size: Override MAX_FILE_SIZE
-        max_duration: Override MAX_DURATION
-    
-    Returns:
-        str: Path to downloaded video
     """
     # Get video info first
     info = get_video_info(url, max_size, max_duration)
@@ -242,7 +241,7 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
         error_msg = "❌ **Video rejected:**\n"
         if info.get("exceeds_size"):
             limit_gb = round((max_size or MAX_FILE_SIZE) / (1024 * 1024 * 1024), 1)
-            error_msg += f"• Size: **{info['size_gb']} GB** (max {limit_gb} GB)\n"
+            error_msg += f"• Size: **{info['size']['gb']} GB** (max {limit_gb} GB)\n"
         if info.get("exceeds_duration"):
             limit_min = round((max_duration or MAX_DURATION) / 60, 1)
             error_msg += f"• Duration: **{info['duration_minutes']} min** (max {limit_min} min)\n"
@@ -251,18 +250,20 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
         return None
     
     # Build info message
-    size_text = f"{info['size_mb']} MB" if info['size_mb'] else "Unknown"
-    if info['size_gb'] and info['size_gb'] > 1:
-        size_text = f"{info['size_gb']} GB ({size_text})"
+    if info['size']['mb'] != "Unknown":
+        size_text = f"{info['size']['mb']} MB"
+        if info['size']['gb'] != "Unknown" and info['size']['gb'] > 1:
+            size_text = f"{info['size']['gb']} GB ({size_text})"
+    else:
+        size_text = "Unknown (will be checked during download)"
     
     # Add risk warning for large files
     warning_text = ""
     if info.get("is_warning"):
-        warning_text = "\n\n⚠️ **Warning:** Large file may take time and use significant resources"
-        if info['size_gb'] and info['size_gb'] > 1.8:
-            warning_text = "\n\n⚠️ **High Risk:** Very large file may fail on free hosting"
-        elif info['size_gb'] and info['size_gb'] > 1.2:
-            warning_text = "\n\n⚠️ **Risk:** Large file may be slow or timeout"
+        if info['size']['gb'] != "Unknown" and info['size']['gb'] > 1.8:
+            warning_text = "\n\n⚠️ **High Risk:** Very large file may take time"
+        elif info['size']['gb'] != "Unknown" and info['size']['gb'] > 1.2:
+            warning_text = "\n\n⚠️ **Note:** Large file may take several minutes"
     
     # Show video info to user
     await status_msg.edit(
@@ -276,7 +277,7 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
     )
     
     try:
-        # Download the video with limits
+        # Download the video
         video_path = download_video_from_url(url, None, max_size, max_duration)
         
         # Verify download was successful
@@ -286,11 +287,17 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
         
         # Check actual file size
         actual_size = os.path.getsize(video_path)
-        if actual_size > (max_size or MAX_FILE_SIZE):
+        size_limit = max_size if max_size is not None else MAX_FILE_SIZE
+        if actual_size > size_limit:
             os.remove(video_path)
-            await status_msg.edit("❌ Downloaded file exceeds size limit")
+            await status_msg.edit(
+                f"❌ Downloaded file exceeds size limit\n"
+                f"📦 Size: {round(actual_size/(1024*1024*1024), 2)} GB\n"
+                f"⚠️ Max: {round(size_limit/(1024*1024*1024), 1)} GB"
+            )
             return None
         
+        await status_msg.edit(f"✅ Download complete!\n📦 Size: {round(actual_size/(1024*1024), 2)} MB")
         return video_path
         
     except Exception as e:
@@ -298,13 +305,7 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
         return None
 
 def set_limits(max_size_gb=None, max_duration_min=None):
-    """
-    Dynamically change the limits
-    
-    Args:
-        max_size_gb: Max file size in GB (e.g., 2.0 for 2GB)
-        max_duration_min: Max duration in minutes (e.g., 120 for 2 hours)
-    """
+    """Dynamically change the limits"""
     global MAX_FILE_SIZE, MAX_DURATION
     
     if max_size_gb is not None:
@@ -316,9 +317,7 @@ def set_limits(max_size_gb=None, max_duration_min=None):
     return MAX_FILE_SIZE, MAX_DURATION
 
 def get_current_limits():
-    """
-    Get current limits
-    """
+    """Get current limits"""
     return {
         "max_size_bytes": MAX_FILE_SIZE,
         "max_size_mb": round(MAX_FILE_SIZE / (1024 * 1024), 1),
