@@ -9,7 +9,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_scene_score
-from down import download_video_from_url
+from down import download_with_status, get_current_limits
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
@@ -98,9 +98,9 @@ async def process_video(video_path, user_id, target, status_msg):
 
     duration = total_frames / fps
 
-    if duration > 3600:
+    if duration > 7200:  # Increased to 2 hours
         await status_msg.edit(
-            "❌ Video too long (max 60 minutes)"
+            "❌ Video too long (max 120 minutes)"
         )
         cap.release()
         return None
@@ -287,20 +287,27 @@ async def callback(_, query):
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
+    # Get current limits for display
+    limits = get_current_limits()
+    
     await msg.reply(
-        "🎬 **Video Highlight Bot**\n\n"
-        "Send me a video or use /url to get the best highlights!\n\n"
-        "✨ **Features:**\n"
-        "• Scene detection\n"
-        "• Motion analysis\n"
-        "• Body detection (Enhanced)\n"
-        "• NSFW filtering (High Priority)\n"
-        "• Progress bars\n"
-        "• Cancel button\n\n"
-        "⚙ **Commands:**\n"
-        "/settings <1-200> - Set number of images\n"
-        "/url <video_url> - Process video from URL\n\n"
-        "📦 **Output:** ZIP file with highlights"
+        f"🎬 **Video Highlight Bot**\n\n"
+        f"Send me a video or use /url to get the best highlights!\n\n"
+        f"✨ **Features:**\n"
+        f"• Scene detection\n"
+        f"• Motion analysis\n"
+        f"• Body detection (Enhanced)\n"
+        f"• NSFW filtering (High Priority)\n"
+        f"• Progress bars\n"
+        f"• Cancel button\n\n"
+        f"📦 **Limits:**\n"
+        f"• Max Size: {limits['max_size_gb']} GB\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
+        f"⚙ **Commands:**\n"
+        f"/settings <1-200> - Set number of images\n"
+        f"/url <video_url> - Process video from URL\n"
+        f"/limits - Show current limits\n\n"
+        f"📦 **Output:** ZIP file with highlights"
     )
 
 @bot.on_message(filters.command("settings"))
@@ -318,6 +325,17 @@ async def settings(_, msg):
     
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to **{count}**")
+
+@bot.on_message(filters.command("limits"))
+async def limits_command(_, msg):
+    """Show current limits"""
+    limits = get_current_limits()
+    await msg.reply(
+        f"📊 **Current Limits:**\n\n"
+        f"📦 **Max File Size:** {limits['max_size_gb']} GB ({limits['max_size_mb']} MB)\n"
+        f"⏱️ **Max Duration:** {limits['max_duration_minutes']} minutes ({limits['max_duration_hours']} hours)\n\n"
+        f"⚠️ Videos exceeding these limits will be rejected."
+    )
 
 @bot.on_message(filters.command("url"))
 async def url_handler(_, msg):
@@ -338,17 +356,20 @@ async def url_handler(_, msg):
     if not url.startswith(("http://", "https://")):
         return await msg.reply("❌ Invalid URL. Please include http:// or https://")
 
-    status = await msg.reply("⬇️ **Downloading video from URL...**")
+    status = await msg.reply("🔍 **Checking video...**")
 
     try:
-        video_path = download_video_from_url(url)
+        # Use the enhanced download function with status updates
+        video_path = await download_with_status(url, status)
         
-        if not os.path.exists(video_path):
-            return await status.edit("❌ Video file not found after download")
+        if not video_path:
+            # Error message already sent by download_with_status
+            return
 
     except Exception as e:
         return await status.edit(f"❌ **Download failed**\n```{str(e)}```")
 
+    # Process the downloaded video
     zip_path = await process_video(video_path, user_id, target, status)
     
     if not zip_path:
@@ -386,6 +407,7 @@ async def video_handler(_, msg):
     status = await msg.reply("⬇️ **Downloading video...**")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
+    # Process the downloaded video
     zip_path = await process_video(video_path, user_id, target, status)
     
     if not zip_path:
@@ -415,27 +437,33 @@ async def video_handler(_, msg):
 # ---------------- HELP COMMAND ----------------
 @bot.on_message(filters.command("help"))
 async def help_command(_, msg):
+    limits = get_current_limits()
+    
     await msg.reply(
-        "**📖 Help Guide**\n\n"
-        "**How to use:**\n"
-        "1️⃣ Send me any video file\n"
-        "2️⃣ Or use `/url <video_link>`\n"
-        "3️⃣ I'll analyze and extract highlights\n"
-        "4️⃣ Get ZIP file with best frames\n\n"
-        "**Settings:**\n"
-        "• `/settings 50` - Extract 50 images\n"
-        "• Maximum: 200 images\n\n"
-        "**Features:**\n"
-        "• Smart scene detection\n"
-        "• Motion analysis\n"
-        "• Enhanced face and body detection\n"
-        "• NSFW content filtering (High Priority)\n"
-        "• High-quality JPEG output\n"
-        "• 720p processing for better performance\n"
-        "• Support for long videos\n"
-        "• Real-time progress bars\n"
-        "• Cancel button\n\n"
-        "**Support:**\n"
-        "• Send /start to begin\n"
-        "• Send /help for this menu"
+        f"**📖 Help Guide**\n\n"
+        f"**How to use:**\n"
+        f"1️⃣ Send me any video file\n"
+        f"2️⃣ Or use `/url <video_link>`\n"
+        f"3️⃣ I'll analyze and extract highlights\n"
+        f"4️⃣ Get ZIP file with best frames\n\n"
+        f"**Settings:**\n"
+        f"• `/settings 50` - Extract 50 images\n"
+        f"• Maximum: {MAX_LIMIT} images\n"
+        f"• `/limits` - Show current limits\n\n"
+        f"**Limits:**\n"
+        f"• Max Size: {limits['max_size_gb']} GB\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
+        f"**Features:**\n"
+        f"• Smart scene detection\n"
+        f"• Motion analysis\n"
+        f"• Enhanced face and body detection\n"
+        f"• NSFW content filtering (High Priority)\n"
+        f"• High-quality JPEG output\n"
+        f"• 720p processing for better performance\n"
+        f"• Support for long videos (up to {limits['max_duration_minutes']} min)\n"
+        f"• Real-time progress bars\n"
+        f"• Cancel button\n\n"
+        f"**Support:**\n"
+        f"• Send /start to begin\n"
+        f"• Send /help for this menu"
     )
