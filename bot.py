@@ -3,7 +3,9 @@ import cv2
 import zipfile
 import shutil
 import numpy as np
+import asyncio
 from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_scene_score
@@ -17,8 +19,8 @@ OUTPUT_DIR = "output"
 MAX_LIMIT = 200
 URL_REGEX = r"^https?://"
 
-# Cancel tasks dictionary
-cancel_tasks = {}
+# Cancel tracking
+cancel_users = {}
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
     os.makedirs(d, exist_ok=True)
@@ -66,9 +68,17 @@ def body_score(frame):
     )
     score = 0
     h, w, _ = frame.shape
+    
+    # Improved body scoring with higher weights for larger bodies
     for (x, y, bw, bh) in boxes:
         ratio = (bw * bh) / (w * h)
-        score += 150 if ratio > 0.15 else 80
+        if ratio > 0.20:
+            score += 300  # Large body - high score
+        elif ratio > 0.10:
+            score += 150  # Medium body - medium score
+        else:
+            score += 50   # Small body - lower score
+            
     return score, boxes
 
 async def process_video(video_path, user_id, target, status_msg):
@@ -106,14 +116,30 @@ async def process_video(video_path, user_id, target, status_msg):
     prev_frame = None
     scored_frames = []
 
-    await status_msg.edit("🎞 Analysing video…")
+    # Create cancel button markup
+    cancel_markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="cancel"
+                )
+            ]
+        ]
+    )
+
+    await status_msg.edit(
+        "🎞 Analysing video…",
+        reply_markup=cancel_markup
+    )
 
     # PASS 1 (SCORING)
     while cap.isOpened():
-        # Check for cancel command
-        if cancel_tasks.get(user_id):
+        # Check for cancel
+        if cancel_users.get(user_id):
             cap.release()
             await status_msg.edit("🛑 Cancelled by user.")
+            cancel_users[user_id] = False
             return None
         
         ret, frame = cap.read()
@@ -122,12 +148,18 @@ async def process_video(video_path, user_id, target, status_msg):
 
         frame_index += 1
         
-        # Progress update every 5000 frames
-        if frame_index % 5000 == 0:
+        # Prevent bot from dying on long videos
+        if frame_index % 100 == 0:
+            await asyncio.sleep(0)
+        
+        # Progress bar - Analysis phase
+        if frame_index % 1000 == 0:
+            progress = int((frame_index / total_frames) * 100)
             try:
                 await status_msg.edit(
-                    f"🎞 Analysing...\n"
-                    f"{frame_index}/{total_frames} frames"
+                    f"🎞 Analysing video…\n"
+                    f"📊 Progress: {progress}%",
+                    reply_markup=cancel_markup
                 )
             except:
                 pass
@@ -152,13 +184,13 @@ async def process_video(video_path, user_id, target, status_msg):
             prev_gray
         )
 
-        # Increased NSFW priority - NSFW weight increased from 1.6 to 3.0
+        # Improved scoring with higher body and NSFW weights
         total = (
-            len(faces) * 80 +
-            body_val * 1.0 +
-            motion_score(prev_gray, gray) * 0.8 +
-            scene_change_score(prev_frame, frame) * 1.0 +
-            nsfw * 3.0  # NSFW priority significantly increased
+            len(faces) * 60 +
+            body_val * 2.0 +  # Increased body importance
+            motion_score(prev_gray, gray) +
+            scene_change_score(prev_frame, frame) +
+            nsfw * 3.5  # Higher NSFW weight
         )
 
         scored_frames.append((total, frame_index))
@@ -179,13 +211,17 @@ async def process_video(video_path, user_id, target, status_msg):
     current = 0
     saved = 0
 
-    await status_msg.edit("📸 Extracting frames…")
+    await status_msg.edit(
+        "📸 Extracting frames…",
+        reply_markup=cancel_markup
+    )
 
     while cap.isOpened():
-        # Check for cancel command
-        if cancel_tasks.get(user_id):
+        # Check for cancel
+        if cancel_users.get(user_id):
             cap.release()
             await status_msg.edit("🛑 Cancelled by user.")
+            cancel_users[user_id] = False
             return None
         
         ret, frame = cap.read()
@@ -195,6 +231,14 @@ async def process_video(video_path, user_id, target, status_msg):
         current += 1
         if current not in selected_set:
             continue
+
+        # Progress bar - Extraction phase
+        progress = int((saved / target) * 100)
+        await status_msg.edit(
+            f"📸 Extracting frames…\n"
+            f"📊 Progress: {progress}%",
+            reply_markup=cancel_markup
+        )
 
         # Smaller processing resolution - 720p
         if frame.shape[1] > 720:
@@ -231,6 +275,15 @@ async def process_video(video_path, user_id, target, status_msg):
 
     return zip_path
 
+# ---------------- CALLBACK HANDLER ----------------
+@bot.on_callback_query()
+async def callback(_, query):
+    if query.data == "cancel":
+        user_id = query.from_user.id
+        cancel_users[user_id] = True
+        await query.answer("🛑 Cancelled processing!")
+        await query.message.edit("🛑 Processing cancelled.")
+
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
@@ -240,12 +293,13 @@ async def start(_, msg):
         "✨ **Features:**\n"
         "• Scene detection\n"
         "• Motion analysis\n"
-        "• Body detection\n"
-        "• NSFW filtering (High Priority)\n\n"
+        "• Body detection (Enhanced)\n"
+        "• NSFW filtering (High Priority)\n"
+        "• Progress bars\n"
+        "• Cancel button\n\n"
         "⚙ **Commands:**\n"
         "/settings <1-200> - Set number of images\n"
-        "/url <video_url> - Process video from URL\n"
-        "/cancel - Cancel current processing\n\n"
+        "/url <video_url> - Process video from URL\n\n"
         "📦 **Output:** ZIP file with highlights"
     )
 
@@ -265,19 +319,13 @@ async def settings(_, msg):
     set_count(msg.from_user.id, count)
     await msg.reply(f"✅ Image count set to **{count}**")
 
-@bot.on_message(filters.command("cancel"))
-async def cancel_handler(_, msg):
-    user_id = msg.from_user.id
-    cancel_tasks[user_id] = True
-    await msg.reply("🛑 Processing cancelled.")
-
 @bot.on_message(filters.command("url"))
 async def url_handler(_, msg):
     user_id = msg.from_user.id
     target = min(get_count(user_id), MAX_LIMIT)
     
     # Reset cancel flag
-    cancel_tasks[user_id] = False
+    cancel_users[user_id] = False
 
     if len(msg.command) < 2:
         return await msg.reply(
@@ -301,8 +349,6 @@ async def url_handler(_, msg):
     except Exception as e:
         return await status.edit(f"❌ **Download failed**\n```{str(e)}```")
 
-    await status.edit("🎞 **Processing video...**")
-    
     zip_path = await process_video(video_path, user_id, target, status)
     
     if not zip_path:
@@ -335,13 +381,11 @@ async def video_handler(_, msg):
     target = min(get_count(user_id), MAX_LIMIT)
     
     # Reset cancel flag
-    cancel_tasks[user_id] = False
+    cancel_users[user_id] = False
 
     status = await msg.reply("⬇️ **Downloading video...**")
     video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
-    await status.edit("🎞 **Processing video...**")
-    
     zip_path = await process_video(video_path, user_id, target, status)
     
     if not zip_path:
@@ -381,16 +425,16 @@ async def help_command(_, msg):
         "**Settings:**\n"
         "• `/settings 50` - Extract 50 images\n"
         "• Maximum: 200 images\n\n"
-        "**Cancel Processing:**\n"
-        "• Use `/cancel` to stop current processing\n\n"
         "**Features:**\n"
         "• Smart scene detection\n"
         "• Motion analysis\n"
-        "• Face and body detection\n"
+        "• Enhanced face and body detection\n"
         "• NSFW content filtering (High Priority)\n"
         "• High-quality JPEG output\n"
         "• 720p processing for better performance\n"
-        "• Support for long videos\n\n"
+        "• Support for long videos\n"
+        "• Real-time progress bars\n"
+        "• Cancel button\n\n"
         "**Support:**\n"
         "• Send /start to begin\n"
         "• Send /help for this menu"
