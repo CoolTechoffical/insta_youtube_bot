@@ -5,23 +5,12 @@ DOWNLOAD_DIR = "downloads"
 
 # ============ CONFIGURABLE LIMITS ============
 # You can change these values based on your hosting
-# For 2GB files, set MAX_FILE_SIZE to 2GB
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (2048 MB)
 MAX_DURATION = 7200  # 120 minutes (2 hours)
 
 # Warning thresholds (not rejections, just warnings)
 WARN_FILE_SIZE = 1.5 * 1024 * 1024 * 1024  # 1.5 GB - Show warning
 WARN_DURATION = 5400  # 90 minutes - Show warning
-
-# ============ RISK LEVELS ============
-# These are for reference only
-RISK_LEVELS = {
-    "SAFE": 500 * 1024 * 1024,        # 500 MB - Definitely safe
-    "OK": 1 * 1024 * 1024 * 1024,     # 1 GB - Usually safe
-    "RISKY": 1.5 * 1024 * 1024 * 1024, # 1.5 GB - Risk of timeout
-    "DANGER": 2 * 1024 * 1024 * 1024,  # 2 GB - High risk on free hosting
-    "MAX": 2.5 * 1024 * 1024 * 1024,   # 2.5 GB - Maximum possible
-}
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -58,7 +47,6 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
                 size_mb = round(size / (1024 * 1024), 2)
                 size_gb = round(size / (1024 * 1024 * 1024), 2)
                 
-                # Check against limit
                 if size > size_limit:
                     limit_gb = round(size_limit / (1024 * 1024 * 1024), 1)
                     raise Exception(
@@ -66,11 +54,6 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
                         f"📦 Size: {size_gb} GB ({size_mb} MB)\n"
                         f"⚠️ Please use a smaller video"
                     )
-                
-                # Show warning for large files
-                if size > WARN_FILE_SIZE and status_callback:
-                    # This will be handled by the callback
-                    pass
             else:
                 size_mb = None
                 size_gb = None
@@ -86,11 +69,6 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
                     f"⏱️ Duration: {minutes} minutes\n"
                     f"⚠️ Please use a shorter video"
                 )
-            
-            # Show warning for long videos
-            if duration > WARN_DURATION and status_callback:
-                # This will be handled by the callback
-                pass
             
             # Check if video has audio/video streams
             if not info.get("formats"):
@@ -208,18 +186,6 @@ def get_video_info(url, max_size=None, max_duration=None):
             size_limit = max_size if max_size is not None else MAX_FILE_SIZE
             duration_limit = max_duration if max_duration is not None else MAX_DURATION
             
-            # Calculate risk level
-            risk_level = "SAFE"
-            if size:
-                if size > 2 * 1024 * 1024 * 1024:
-                    risk_level = "MAX"
-                elif size > 1.5 * 1024 * 1024 * 1024:
-                    risk_level = "DANGER"
-                elif size > 1 * 1024 * 1024 * 1024:
-                    risk_level = "RISKY"
-                elif size > 500 * 1024 * 1024:
-                    risk_level = "OK"
-            
             return {
                 "title": info.get("title", "Unknown"),
                 "duration": duration,
@@ -238,7 +204,6 @@ def get_video_info(url, max_size=None, max_duration=None):
                     (size is not None and size > WARN_FILE_SIZE) or
                     duration > WARN_DURATION
                 ),
-                "risk_level": risk_level,
                 "formats": len(info.get("formats", [])),
                 "thumbnail": info.get("thumbnail"),
                 "description": info.get("description", "")[:200],
@@ -294,9 +259,9 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
     warning_text = ""
     if info.get("is_warning"):
         warning_text = "\n\n⚠️ **Warning:** Large file may take time and use significant resources"
-        if info.get("risk_level") == "DANGER":
+        if info['size_gb'] and info['size_gb'] > 1.8:
             warning_text = "\n\n⚠️ **High Risk:** Very large file may fail on free hosting"
-        elif info.get("risk_level") == "RISKY":
+        elif info['size_gb'] and info['size_gb'] > 1.2:
             warning_text = "\n\n⚠️ **Risk:** Large file may be slow or timeout"
     
     # Show video info to user
@@ -331,8 +296,6 @@ async def download_with_status(url, status_msg, max_size=None, max_duration=None
     except Exception as e:
         await status_msg.edit(f"❌ {str(e)}")
         return None
-
-# ============ CONVENIENCE FUNCTIONS ============
 
 def set_limits(max_size_gb=None, max_duration_min=None):
     """
