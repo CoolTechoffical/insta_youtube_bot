@@ -225,6 +225,33 @@ def get_video_info(url, max_size=None, max_duration=None):
             "error": str(e),
             "is_valid": False
         }
+def get_video_info(url):
+
+    ydl_opts = {
+        "quiet": True,
+        "noplaylist": True
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        info = ydl.extract_info(
+            url,
+            download=False
+        )
+
+        return {
+            "title": info.get("title", "Unknown"),
+            "duration": info.get("duration", 0),
+            "uploader": info.get("uploader", "Unknown"),
+            "view_count": info.get("view_count", 0),
+            "width": info.get("width", 0),
+            "height": info.get("height", 0),
+            "filesize": (
+                info.get("filesize")
+                or info.get("filesize_approx")
+                or 0
+            )
+        }
 
 async def download_with_status(url, status_msg, max_size=None, max_duration=None):
     """
