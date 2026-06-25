@@ -9,7 +9,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import API_ID, API_HASH, BOT_TOKEN
 from user_settings import get_count, set_count
 from nsfw import nsfw_scene_score
-from down import download_with_status, get_current_limits
+from down import download_with_status, get_current_limits, get_video_info
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
