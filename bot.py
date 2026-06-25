@@ -486,6 +486,66 @@ async def video_handler(_, msg):
     except:
         pass
 
+@bot.on_message(filters.command("info"))
+async def info_handler(_, msg):
+
+    if len(msg.command) < 2:
+
+        return await msg.reply(
+            "Usage:\n"
+            "/info <video_url>"
+        )
+
+    url = msg.command[1]
+
+    status = await msg.reply(
+        "🔍 Getting video information..."
+    )
+
+    try:
+
+        data = get_video_info(url)
+
+        duration = data["duration"]
+
+        hours = duration // 3600
+        minutes = (duration % 3600) // 60
+        seconds = duration % 60
+
+        size_mb = round(
+            data["filesize"] /
+            (1024 * 1024),
+            2
+        )
+
+        text = (
+            f"📹 Title:\n"
+            f"{data['title']}\n\n"
+
+            f"👤 Uploader:\n"
+            f"{data['uploader']}\n\n"
+
+            f"⏱ Duration:\n"
+            f"{hours:02}:{minutes:02}:{seconds:02}\n\n"
+
+            f"📺 Resolution:\n"
+            f"{data['width']}x{data['height']}\n\n"
+
+            f"👁 Views:\n"
+            f"{data['view_count']}\n\n"
+
+            f"📦 Size:\n"
+            f"{size_mb} MB"
+        )
+
+        await status.edit(text)
+
+    except Exception as e:
+
+        await status.edit(
+            f"❌ Failed\n\n{e}"
+        )
+
 # ---------------- HELP COMMAND ----------------
 @bot.on_message(filters.command("help"))
 async def help_command(_, msg):
