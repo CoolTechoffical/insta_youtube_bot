@@ -83,30 +83,31 @@ def download_video_from_url(url, status_callback=None, max_size=None, max_durati
 
     # Prepare download options
     ydl_opts = {
-        "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
-        "quiet": False,  # Set to False for debugging
-        "noplaylist": True,
-        "merge_output_format": "mp4",
-        "restrictfilenames": True,
-        "extractor_args": {
-            "generic": {
-                "impersonate": ["chrome"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/137.0 Safari/537.36"
-            )
-        },
-        # For large files
-        "fragment_retries": 10,
-        "retries": 10,
-        "continuedl": True,
-        "progress_hooks": [lambda d: _progress_hook(d, status_callback)]
+    "outtmpl": f"{DOWNLOAD_DIR}/%(id)s.%(ext)s",
+    "quiet": False,
+    "noplaylist": True,
+    "merge_output_format": "mp4",
+    "restrictfilenames": True,
+
+    "extractor_args": {
+        "generic": {
+            "impersonate": ["chrome"]
+        }
+    },
+
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/137.0.0.0 Safari/537.36"
+        )
+    },
+
+    "retries": 10,
+    "fragment_retries": 10,
+    "continuedl": True,
+    "progress_hooks": [lambda d: _progress_hook(d, status_callback)]
+
     }
 
     try:
