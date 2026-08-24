@@ -43,8 +43,12 @@ if face_cascade.empty():
     raise RuntimeError(
         "❌ Failed to load OpenCV Haar cascade"
     )
+
 hog = cv2.HOGDescriptor()
-hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+hog.setSVMDetector(
+    cv2.HOGDescriptor_getDefaultPeopleDetector()
+)
 
 # ---------------- BOT ----------------
 bot = Client(
