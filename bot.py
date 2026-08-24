@@ -43,7 +43,6 @@ if face_cascade.empty():
     raise RuntimeError(
         "❌ Failed to load OpenCV Haar cascade"
     )
-
 hog = cv2.HOGDescriptor()
 
 hog.setSVMDetector(
