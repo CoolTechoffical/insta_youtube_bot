@@ -35,9 +35,14 @@ for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
 
 # ---------------- DETECTORS ----------------
 face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades +
     "haarcascade_frontalface_default.xml"
 )
 
+if face_cascade.empty():
+    raise RuntimeError(
+        "❌ Failed to load OpenCV Haar cascade"
+    )
 hog = cv2.HOGDescriptor()
 hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
