@@ -1,324 +1,96 @@
 import os
-import cv2
-import zipfile
 import shutil
+import zipfile
+import cv2
+
+BASE_DIR = "upscale_work"
+
+SUPPORTED_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp"
+)
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+def make_user_dirs(user_id):
+    user_dir = os.path.join(BASE_DIR, str(user_id))
+    input_dir = os.path.join(user_dir, "input")
+    output_dir = os.path.join(user_dir, "output")
 
-MODEL_NAME = "RealESRGAN_x4plus"
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-MODEL_PATH = "models/RealESRGAN_x4plus.pth"
-
-SCALE = 4
-
-MAX_4K_WIDTH = 3840
-MAX_4K_HEIGHT = 2160
+    return user_dir, input_dir, output_dir
 
 
-# ============================================================
-# MODEL CACHE
-# ============================================================
+def cleanup_user(user_id):
+    user_dir = os.path.join(BASE_DIR, str(user_id))
 
-_model = None
-
-
-# ============================================================
-# LOAD REAL-ESRGAN MODEL
-# ============================================================
-
-def load_model():
-
-    global _model
-
-    if _model is not None:
-        return _model
-
-    try:
-
-        from basicsr.archs.rrdbnet_arch import RRDBNet
-        from realesrgan import RealESRGANer
-
-    except ImportError as e:
-
-        raise RuntimeError(
-            "Real-ESRGAN dependencies are missing.\n"
-            "Install:\n"
-            "torch\n"
-            "torchvision\n"
-            "basicsr\n"
-            "realesrgan"
-        ) from e
-
-    if not os.path.exists(MODEL_PATH):
-
-        raise FileNotFoundError(
-            f"Real-ESRGAN model not found:\n"
-            f"{MODEL_PATH}"
-        )
-
-    # ========================================================
-    # REAL-ESRGAN X4 ARCHITECTURE
-    # ========================================================
-
-    model = RRDBNet(
-        num_in_ch=3,
-        num_out_ch=3,
-        num_feat=64,
-        num_block=23,
-        num_grow_ch=32,
-        scale=4
-    )
-
-    _model = RealESRGANer(
-        scale=4,
-        model_path=MODEL_PATH,
-        model=model,
-        tile=256,
-        tile_pad=10,
-        pre_pad=0,
-        half=False
-    )
-
-    return _model
+    if os.path.exists(user_dir):
+        shutil.rmtree(user_dir, ignore_errors=True)
 
 
-# ============================================================
-# LIMIT IMAGE TO 4K
-# ============================================================
+def upscale_image(input_path, output_path, scale=4):
+    image = cv2.imread(input_path)
 
-def limit_to_4k(image):
+    if image is None:
+        raise ValueError("Unable to read image")
 
     height, width = image.shape[:2]
 
-    if (
-        width <= MAX_4K_WIDTH
-        and height <= MAX_4K_HEIGHT
-    ):
-        return image
+    new_width = width * scale
+    new_height = height * scale
 
-    ratio = min(
-        MAX_4K_WIDTH / width,
-        MAX_4K_HEIGHT / height
-    )
+    # Prevent accidental enormous memory allocation
+    if new_width * new_height > 120_000_000:
+        raise ValueError("Output image is too large")
 
-    new_width = max(
-        1,
-        int(width * ratio)
-    )
-
-    new_height = max(
-        1,
-        int(height * ratio)
-    )
-
-    return cv2.resize(
+    upscaled = cv2.resize(
         image,
-        (
-            new_width,
-            new_height
-        ),
-        interpolation=cv2.INTER_AREA
+        (new_width, new_height),
+        interpolation=cv2.INTER_LANCZOS4
     )
-
-
-# ============================================================
-# SAVE IMAGE
-# ============================================================
-
-def save_image(
-    output_path,
-    image
-):
-
-    extension = os.path.splitext(
-        output_path
-    )[1].lower()
 
     os.makedirs(
         os.path.dirname(output_path),
         exist_ok=True
     )
 
-    if extension in (
-        ".jpg",
-        ".jpeg"
-    ):
-
-        success = cv2.imwrite(
-            output_path,
-            image,
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                98
-            ]
-        )
-
-    elif extension == ".png":
-
-        success = cv2.imwrite(
-            output_path,
-            image,
-            [
-                cv2.IMWRITE_PNG_COMPRESSION,
-                2
-            ]
-        )
-
-    else:
-
-        success = cv2.imwrite(
-            output_path,
-            image
-        )
+    # Save as JPG
+    success = cv2.imwrite(
+        output_path,
+        upscaled,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            95
+        ]
+    )
 
     if not success:
-
-        raise RuntimeError(
-            f"Failed to save image: {output_path}"
-        )
+        raise ValueError("Unable to save image")
 
 
-# ============================================================
-# UPSCALE ONE IMAGE
-# ============================================================
+def extract_zip(zip_path, input_dir):
+    with zipfile.ZipFile(zip_path, "r") as z:
 
-def upscale_image(
-    input_path,
-    output_path,
-    max_4k=True
-):
+        # Basic ZIP path traversal protection
+        for member in z.namelist():
 
-    if not os.path.exists(input_path):
+            target = os.path.abspath(
+                os.path.join(input_dir, member)
+            )
 
-        raise FileNotFoundError(
-            input_path
-        )
+            base = os.path.abspath(input_dir)
 
-    # --------------------------------------------------------
-    # READ IMAGE
-    # --------------------------------------------------------
-
-    image = cv2.imread(
-        input_path,
-        cv2.IMREAD_COLOR
-    )
-
-    if image is None:
-
-        raise ValueError(
-            f"Unable to read image:\n"
-            f"{input_path}"
-        )
-
-    # --------------------------------------------------------
-    # LOAD MODEL
-    # --------------------------------------------------------
-
-    upsampler = load_model()
-
-    # --------------------------------------------------------
-    # REAL-ESRGAN
-    # --------------------------------------------------------
-
-    try:
-
-        output, _ = upsampler.enhance(
-            image,
-            outscale=SCALE
-        )
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"Real-ESRGAN failed:\n{e}"
-        )
-
-    # --------------------------------------------------------
-    # 4K LIMIT
-    # --------------------------------------------------------
-
-    if max_4k:
-
-        output = limit_to_4k(
-            output
-        )
-
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
-    save_image(
-        output_path,
-        output
-    )
-
-    del image
-    del output
-
-    return output_path
-
-
-# ============================================================
-# CLEANUP USER FILES
-# ============================================================
-
-def cleanup_user(user_id):
-
-    user_dir = os.path.join(
-        "upscale_work",
-        str(user_id)
-    )
-
-    if os.path.exists(user_dir):
-
-        shutil.rmtree(
-            user_dir,
-            ignore_errors=True
-        )
-
-
-# ============================================================
-# FIND IMAGES IN DIRECTORY
-# ============================================================
-
-def find_images(directory):
-
-    image_files = []
-
-    for root, dirs, files in os.walk(
-        directory
-    ):
-
-        for filename in files:
-
-            if filename.lower().endswith(
-                (
-                    ".jpg",
-                    ".jpeg",
-                    ".png",
-                    ".webp",
-                    ".bmp"
-                )
-            ):
-
-                image_files.append(
-                    os.path.join(
-                        root,
-                        filename
-                    )
+            if not target.startswith(base + os.sep):
+                raise ValueError(
+                    "Unsafe ZIP file detected"
                 )
 
-    image_files.sort()
+        z.extractall(input_dir)
 
-    return image_files
-
-
-# ============================================================
-# PROCESS ZIP
-# ============================================================
 
 def process_zip(
     zip_path,
@@ -327,139 +99,79 @@ def process_zip(
     progress_callback=None,
     cancel_callback=None
 ):
+    """
+    Returns:
 
-    if not os.path.exists(zip_path):
+        output_zip
+        processed
+        failed
+        cancelled
+    """
 
-        raise FileNotFoundError(
-            zip_path
-        )
-
-    # ========================================================
-    # DIRECTORIES
-    # ========================================================
-
-    user_dir = os.path.join(
-        "upscale_work",
-        str(user_id)
+    user_dir, input_dir, output_dir = make_user_dirs(
+        user_id
     )
 
-    extract_dir = os.path.join(
-        user_dir,
-        "input"
+    extract_zip(
+        zip_path,
+        input_dir
     )
 
-    output_dir = os.path.join(
-        user_dir,
-        "output"
-    )
+    images = []
 
-    os.makedirs(
-        extract_dir,
-        exist_ok=True
-    )
+    # Find all images
+    for root, dirs, files in os.walk(input_dir):
 
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
+        for filename in files:
 
-    # ========================================================
-    # EXTRACT ZIP
-    # ========================================================
+            if filename.lower().endswith(
+                SUPPORTED_EXTENSIONS
+            ):
 
-    try:
+                images.append(
+                    os.path.join(
+                        root,
+                        filename
+                    )
+                )
 
-        with zipfile.ZipFile(
-            zip_path,
-            "r"
-        ) as archive:
-
-            archive.extractall(
-                extract_dir
-            )
-
-    except zipfile.BadZipFile:
-
+    if not images:
         raise ValueError(
-            "Invalid or corrupted ZIP file."
+            "No supported images found in ZIP"
         )
 
-    # ========================================================
-    # FIND IMAGES
-    # ========================================================
-
-    image_files = find_images(
-        extract_dir
-    )
-
-    total = len(
-        image_files
-    )
-
-    if total == 0:
-
-        raise ValueError(
-            "No supported images found in ZIP."
-        )
-
+    total = len(images)
     processed = 0
     failed = 0
     cancelled = False
 
-    # ========================================================
-    # PROCESS EACH IMAGE
-    # ========================================================
+    for index, input_path in enumerate(images):
 
-    for index, input_path in enumerate(
-        image_files,
-        start=1
-    ):
+        # Check cancellation
+        if cancel_callback and cancel_callback():
+            cancelled = True
+            break
 
-        # ----------------------------------------------------
-        # CHECK CANCEL
-        # ----------------------------------------------------
-
-        if cancel_callback:
-
-            try:
-
-                if cancel_callback():
-
-                    cancelled = True
-
-                    break
-
-            except Exception:
-
-                pass
-
-        # ----------------------------------------------------
-        # OUTPUT NAME
-        # ----------------------------------------------------
-
-        filename = os.path.basename(
-            input_path
+        relative = os.path.relpath(
+            input_path,
+            input_dir
         )
 
-        name, extension = os.path.splitext(
-            filename
-        )
+        relative_without_ext = os.path.splitext(
+            relative
+        )[0]
 
         output_path = os.path.join(
             output_dir,
-            f"{name}_4K.jpg"
+            relative_without_ext + ".jpg"
         )
-
-        # ----------------------------------------------------
-        # UPSCALE
-        # ----------------------------------------------------
 
         try:
 
             upscale_image(
                 input_path,
                 output_path,
-                max_4k=True
+                scale
             )
 
             processed += 1
@@ -467,37 +179,24 @@ def process_zip(
         except Exception as e:
 
             print(
-                f"[UPSCALE ERROR] "
-                f"{filename}: {e}"
+                f"Upscale failed: "
+                f"{input_path}: {e}"
             )
 
             failed += 1
 
-        # ----------------------------------------------------
-        # PROGRESS
-        # ----------------------------------------------------
-
+        # Progress
         percent = int(
-            (index / total) * 100
+            ((index + 1) / total) * 100
         )
 
         if progress_callback:
 
-            try:
-
-                progress_callback(
-                    percent,
-                    index,
-                    total
-                )
-
-            except Exception:
-
-                pass
-
-    # ========================================================
-    # CANCELLED
-    # ========================================================
+            progress_callback(
+                percent,
+                index + 1,
+                total
+            )
 
     if cancelled:
 
@@ -508,85 +207,48 @@ def process_zip(
             True
         )
 
-    # ========================================================
-    # CHECK OUTPUT
-    # ========================================================
+    if processed == 0:
 
-    output_images = find_images(
-        output_dir
-    )
-
-    if not output_images:
-
-        return (
-            None,
-            processed,
-            failed,
-            False
+        raise ValueError(
+            "No images could be processed"
         )
 
-    # ========================================================
-    # CREATE OUTPUT ZIP
-    # ========================================================
-
+    # Create output ZIP
     output_zip = os.path.join(
         user_dir,
-        f"{user_id}_4K_upscaled.zip"
+        "upscaled_4x.zip"
     )
 
-    try:
+    with zipfile.ZipFile(
+        output_zip,
+        "w",
+        compression=zipfile.ZIP_DEFLATED
+    ) as z:
 
-        with zipfile.ZipFile(
-            output_zip,
-            "w",
-            compression=zipfile.ZIP_DEFLATED
-        ) as archive:
+        for root, dirs, files in os.walk(
+            output_dir
+        ):
 
-            for file_path in output_images:
+            for filename in files:
 
-                archive.write(
-                    file_path,
-                    arcname=os.path.basename(
-                        file_path
-                    )
+                file_path = os.path.join(
+                    root,
+                    filename
                 )
 
-    except Exception as e:
+                arcname = os.path.relpath(
+                    file_path,
+                    output_dir
+                )
 
-        raise RuntimeError(
-            f"Failed to create output ZIP:\n{e}"
-        )
-
-    # ========================================================
-    # RETURN
-    # ========================================================
+                z.write(
+                    file_path,
+                    arcname
+                )
 
     return (
         output_zip,
         processed,
         failed,
         False
-    )
-
-
-# ============================================================
-# SIMPLE TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    input_image = "input.jpg"
-
-    output_image = (
-        "output_4K.jpg"
-    )
-
-    result = upscale_image(
-        input_image,
-        output_image,
-        max_4k=True
-    )
-
-    print(
-        f"Upscaled image saved:\n{result}"
     )
