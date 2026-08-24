@@ -15,6 +15,8 @@ from upscale import (
     cleanup_user
 )
 
+upscale_waiting = set()
+upscale_cancelled = set()
 
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
@@ -525,3 +527,246 @@ async def help_command(_, msg):
         f"• Send /start to begin\n"
         f"• Send /help for this menu"
     )
+
+@bot.on_message(filters.command("up"))
+async def up_command(_, msg):
+
+    user_id = msg.from_user.id
+
+    upscale_waiting.add(user_id)
+    upscale_cancelled.discard(user_id)
+
+    await msg.reply(
+        "🖼️ **4× Image Upscaler**\n\n"
+        "📦 Send a ZIP containing your images.\n\n"
+        "✨ Processing:\n"
+        "• Extract ZIP\n"
+        "• Upscale every image 4×\n"
+        "• Convert to high-quality JPG\n"
+        "• Create a new ZIP\n\n"
+        "❌ Use /cancel to stop."
+    )
+
+@bot.on_message(filters.command("cancel"))
+async def cancel_command(_, msg):
+
+    user_id = msg.from_user.id
+
+    if user_id not in upscale_waiting:
+
+        return await msg.reply(
+            "ℹ️ Nothing is currently running."
+        )
+
+    upscale_cancelled.add(user_id)
+
+    await msg.reply(
+        "🛑 **Cancel requested.**\n"
+        "Stopping after the current image..."
+    )
+
+@bot.on_message(
+    filters.document
+)
+async def upscale_zip_handler(_, msg):
+
+    user_id = msg.from_user.id
+
+    # Only activate after /up
+    if user_id not in upscale_waiting:
+        return
+
+    filename = (
+        msg.document.file_name or ""
+    ).lower()
+
+    if not filename.endswith(".zip"):
+
+        return await msg.reply(
+            "❌ Please send a ZIP file."
+        )
+
+    upscale_waiting.discard(user_id)
+    upscale_cancelled.discard(user_id)
+
+    status = await msg.reply(
+        "📦 ZIP received\n"
+        "⬇️ Downloading..."
+    )
+
+    try:
+
+        user_dir = os.path.join(
+            "upscale_work",
+            str(user_id)
+        )
+
+        os.makedirs(
+            user_dir,
+            exist_ok=True
+        )
+
+        zip_path = await msg.download(
+            file_name=os.path.join(
+                user_dir,
+                "input.zip"
+            )
+        )
+
+    except Exception as e:
+
+        cleanup_user(user_id)
+
+        return await status.edit(
+            f"❌ Download failed\n\n{e}"
+        )
+
+    await status.edit(
+        "📂 Extracting ZIP..."
+    )
+
+    loop = asyncio.get_running_loop()
+
+    last_update = {
+        "percent": -1
+    }
+
+    async def update_status(
+        percent,
+        current,
+        total
+    ):
+        # Don't edit Telegram message for every image
+        if (
+            percent == last_update["percent"]
+            and percent != 100
+        ):
+            return
+
+        last_update["percent"] = percent
+
+        bar_length = 10
+
+        filled = int(
+            bar_length * percent / 100
+        )
+
+        bar = (
+            "█" * filled +
+            "░" * (bar_length - filled)
+        )
+
+        try:
+
+            await status.edit(
+                f"🖼️ **Upscaling images**\n\n"
+                f"`{bar}` **{percent}%**\n\n"
+                f"📸 `{current}/{total}`\n"
+                f"🔍 Scale: **4×**\n\n"
+                "🛑 Press Cancel if needed."
+            )
+
+        except Exception:
+            pass
+
+    def progress_callback(
+        percent,
+        current,
+        total
+    ):
+
+        asyncio.run_coroutine_threadsafe(
+            update_status(
+                percent,
+                current,
+                total
+            ),
+            loop
+        )
+
+    def cancel_callback():
+
+        return user_id in upscale_cancelled
+
+    try:
+
+        await status.edit(
+            "🔍 Finding images..."
+        )
+
+        (
+            output_zip,
+            processed,
+            failed,
+            cancelled
+        ) = await asyncio.to_thread(
+            process_zip,
+            zip_path,
+            user_id,
+            4,
+            progress_callback,
+            cancel_callback
+        )
+
+    except Exception as e:
+
+        cleanup_user(user_id)
+        upscale_cancelled.discard(user_id)
+
+        return await status.edit(
+            f"❌ **Upscaling failed**\n\n{e}"
+        )
+
+    if cancelled:
+
+        cleanup_user(user_id)
+        upscale_cancelled.discard(user_id)
+
+        return await status.edit(
+            "🛑 **Upscaling cancelled.**\n\n"
+            f"Processed before cancellation: "
+            f"{processed}"
+        )
+
+    if not output_zip or not os.path.exists(
+        output_zip
+    ):
+
+        cleanup_user(user_id)
+
+        return await status.edit(
+            "❌ Output ZIP was not created."
+        )
+
+    await status.edit(
+        "📦 Creating final ZIP..."
+    )
+
+    try:
+
+        await msg.reply_document(
+            output_zip,
+            caption=(
+                "✅ **4× Image Upscaling Complete**\n\n"
+                f"🖼️ Processed: **{processed}**\n"
+                f"⚠️ Failed: **{failed}**\n"
+                "🔍 Scale: **4×**\n"
+                "📦 Output: ZIP"
+            )
+        )
+
+        await status.edit(
+            "✅ **Done!**"
+        )
+
+    except Exception as e:
+
+        await status.edit(
+            f"❌ Failed to send ZIP\n\n{e}"
+        )
+
+    finally:
+
+        # Always remove temporary files
+        cleanup_user(user_id)
+        upscale_cancelled.discard(user_id)
