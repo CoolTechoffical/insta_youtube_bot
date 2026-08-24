@@ -16,6 +16,8 @@ from upscale import (
 )
 
 upscale_waiting = set()
+upscale_caption_waiting = set()
+upscale_captions = {}
 upscale_cancelled = set()
 
 # ---------------- PATHS ----------------
@@ -528,43 +530,23 @@ async def help_command(_, msg):
         f"• Send /help for this menu"
     )
 
+
 @bot.on_message(filters.command("up"))
 async def up_command(_, msg):
 
     user_id = msg.from_user.id
 
     upscale_waiting.add(user_id)
+    upscale_caption_waiting.discard(user_id)
     upscale_cancelled.discard(user_id)
 
     await msg.reply(
         "🖼️ **4× Image Upscaler**\n\n"
-        "📦 Send a ZIP containing your images.\n\n"
-        "✨ Processing:\n"
-        "• Extract ZIP\n"
-        "• Upscale every image 4×\n"
-        "• Convert to high-quality JPG\n"
-        "• Create a new ZIP\n\n"
-        "❌ Use /cancel to stop."
+        "📦 Send your ZIP file containing images.\n\n"
+        "⚠️ Only ZIP files are accepted here.\n\n"
+        "❌ Send /cancel to stop."
     )
-
-@bot.on_message(filters.command("cancel"))
-async def cancel_command(_, msg):
-
-    user_id = msg.from_user.id
-
-    if user_id not in upscale_waiting:
-
-        return await msg.reply(
-            "ℹ️ Nothing is currently running."
-        )
-
-    upscale_cancelled.add(user_id)
-
-    await msg.reply(
-        "🛑 **Cancel requested.**\n"
-        "Stopping after the current image..."
-    )
-
+    
 @bot.on_message(
     filters.document
 )
