@@ -1,17 +1,26 @@
 import os
-import gc
 import cv2
+import zipfile
+import shutil
+
 
 # ============================================================
-# REAL-ESRGAN 4× SUPER-RESOLUTION
+# CONFIGURATION
 # ============================================================
+
+MODEL_NAME = "RealESRGAN_x4plus"
 
 MODEL_PATH = "models/RealESRGAN_x4plus.pth"
 
 SCALE = 4
 
-# Keep this True for maximum 3840×2160 output.
-MAX_4K = True
+MAX_4K_WIDTH = 3840
+MAX_4K_HEIGHT = 2160
+
+
+# ============================================================
+# MODEL CACHE
+# ============================================================
 
 _model = None
 
@@ -37,19 +46,17 @@ def load_model():
         raise RuntimeError(
             "Real-ESRGAN dependencies are missing.\n"
             "Install:\n"
-            "basicsr\n"
-            "realesrgan\n"
             "torch\n"
-            "torchvision"
+            "torchvision\n"
+            "basicsr\n"
+            "realesrgan"
         ) from e
 
     if not os.path.exists(MODEL_PATH):
 
         raise FileNotFoundError(
             f"Real-ESRGAN model not found:\n"
-            f"{MODEL_PATH}\n\n"
-            "Place RealESRGAN_x4plus.pth inside:\n"
-            "models/"
+            f"{MODEL_PATH}"
         )
 
     # ========================================================
@@ -65,26 +72,13 @@ def load_model():
         scale=4
     )
 
-    # ========================================================
-    # UPSAMPLER
-    # ========================================================
-
     _model = RealESRGANer(
-
         scale=4,
-
         model_path=MODEL_PATH,
-
         model=model,
-
-        # Smaller tile = lower RAM usage
         tile=256,
-
         tile_pad=10,
-
         pre_pad=0,
-
-        # CPU-safe
         half=False
     )
 
@@ -92,28 +86,22 @@ def load_model():
 
 
 # ============================================================
-# OPTIONAL 4K LIMIT
+# LIMIT IMAGE TO 4K
 # ============================================================
 
 def limit_to_4k(image):
 
-    if image is None:
-        return None
-
     height, width = image.shape[:2]
 
-    max_width = 3840
-    max_height = 2160
-
     if (
-        width <= max_width
-        and height <= max_height
+        width <= MAX_4K_WIDTH
+        and height <= MAX_4K_HEIGHT
     ):
         return image
 
     ratio = min(
-        max_width / width,
-        max_height / height
+        MAX_4K_WIDTH / width,
+        MAX_4K_HEIGHT / height
     )
 
     new_width = max(
@@ -137,6 +125,63 @@ def limit_to_4k(image):
 
 
 # ============================================================
+# SAVE IMAGE
+# ============================================================
+
+def save_image(
+    output_path,
+    image
+):
+
+    extension = os.path.splitext(
+        output_path
+    )[1].lower()
+
+    os.makedirs(
+        os.path.dirname(output_path),
+        exist_ok=True
+    )
+
+    if extension in (
+        ".jpg",
+        ".jpeg"
+    ):
+
+        success = cv2.imwrite(
+            output_path,
+            image,
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                98
+            ]
+        )
+
+    elif extension == ".png":
+
+        success = cv2.imwrite(
+            output_path,
+            image,
+            [
+                cv2.IMWRITE_PNG_COMPRESSION,
+                2
+            ]
+        )
+
+    else:
+
+        success = cv2.imwrite(
+            output_path,
+            image
+        )
+
+    if not success:
+
+        raise RuntimeError(
+            f"Failed to save image: {output_path}"
+        )
+
+
+# ============================================================
 # UPSCALE ONE IMAGE
 # ============================================================
 
@@ -149,12 +194,12 @@ def upscale_image(
     if not os.path.exists(input_path):
 
         raise FileNotFoundError(
-            f"Input image not found:\n{input_path}"
+            input_path
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # READ IMAGE
-    # ========================================================
+    # --------------------------------------------------------
 
     image = cv2.imread(
         input_path,
@@ -164,38 +209,36 @@ def upscale_image(
     if image is None:
 
         raise ValueError(
-            f"Unable to read image:\n{input_path}"
+            f"Unable to read image:\n"
+            f"{input_path}"
         )
 
-    # ========================================================
-    # LOAD AI MODEL
-    # ========================================================
+    # --------------------------------------------------------
+    # LOAD MODEL
+    # --------------------------------------------------------
 
     upsampler = load_model()
 
-    # ========================================================
-    # REAL AI SUPER-RESOLUTION
-    # ========================================================
+    # --------------------------------------------------------
+    # REAL-ESRGAN
+    # --------------------------------------------------------
 
     try:
 
         output, _ = upsampler.enhance(
             image,
-            outscale=4
+            outscale=SCALE
         )
 
     except Exception as e:
 
-        del image
-        gc.collect()
-
         raise RuntimeError(
-            f"Real-ESRGAN enhancement failed:\n{e}"
+            f"Real-ESRGAN failed:\n{e}"
         )
 
-    # ========================================================
-    # OPTIONAL 4K MAXIMUM
-    # ========================================================
+    # --------------------------------------------------------
+    # 4K LIMIT
+    # --------------------------------------------------------
 
     if max_4k:
 
@@ -203,110 +246,327 @@ def upscale_image(
             output
         )
 
-    # ========================================================
-    # SAVE OUTPUT
-    # ========================================================
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
 
-    output_dir = os.path.dirname(
-        output_path
+    save_image(
+        output_path,
+        output
     )
-
-    if output_dir:
-
-        os.makedirs(
-            output_dir,
-            exist_ok=True
-        )
-
-    extension = os.path.splitext(
-        output_path
-    )[1].lower()
-
-    if extension in (
-        ".jpg",
-        ".jpeg"
-    ):
-
-        success = cv2.imwrite(
-            output_path,
-            output,
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                98
-            ]
-        )
-
-    elif extension == ".png":
-
-        success = cv2.imwrite(
-            output_path,
-            output,
-            [
-                cv2.IMWRITE_PNG_COMPRESSION,
-                2
-            ]
-        )
-
-    elif extension == ".webp":
-
-        success = cv2.imwrite(
-            output_path,
-            output,
-            [
-                cv2.IMWRITE_WEBP_QUALITY,
-                98
-            ]
-        )
-
-    else:
-
-        success = cv2.imwrite(
-            output_path,
-            output
-        )
-
-    # ========================================================
-    # MEMORY CLEANUP
-    # ========================================================
 
     del image
     del output
-
-    gc.collect()
-
-    if not success:
-
-        raise RuntimeError(
-            f"Failed to save output image:\n"
-            f"{output_path}"
-        )
 
     return output_path
 
 
 # ============================================================
-# GET OUTPUT INFORMATION
+# CLEANUP USER FILES
 # ============================================================
 
-def get_image_dimensions(image_path):
+def cleanup_user(user_id):
 
-    image = cv2.imread(
-        image_path,
-        cv2.IMREAD_IGNORE_ORIENTATION
+    user_dir = os.path.join(
+        "upscale_work",
+        str(user_id)
     )
 
-    if image is None:
+    if os.path.exists(user_dir):
 
-        return None
+        shutil.rmtree(
+            user_dir,
+            ignore_errors=True
+        )
 
-    height, width = image.shape[:2]
 
-    del image
+# ============================================================
+# FIND IMAGES IN DIRECTORY
+# ============================================================
 
-    return {
-        "width": width,
-        "height": height
-    }
+def find_images(directory):
+
+    image_files = []
+
+    for root, dirs, files in os.walk(
+        directory
+    ):
+
+        for filename in files:
+
+            if filename.lower().endswith(
+                (
+                    ".jpg",
+                    ".jpeg",
+                    ".png",
+                    ".webp",
+                    ".bmp"
+                )
+            ):
+
+                image_files.append(
+                    os.path.join(
+                        root,
+                        filename
+                    )
+                )
+
+    image_files.sort()
+
+    return image_files
+
+
+# ============================================================
+# PROCESS ZIP
+# ============================================================
+
+def process_zip(
+    zip_path,
+    user_id,
+    scale=4,
+    progress_callback=None,
+    cancel_callback=None
+):
+
+    if not os.path.exists(zip_path):
+
+        raise FileNotFoundError(
+            zip_path
+        )
+
+    # ========================================================
+    # DIRECTORIES
+    # ========================================================
+
+    user_dir = os.path.join(
+        "upscale_work",
+        str(user_id)
+    )
+
+    extract_dir = os.path.join(
+        user_dir,
+        "input"
+    )
+
+    output_dir = os.path.join(
+        user_dir,
+        "output"
+    )
+
+    os.makedirs(
+        extract_dir,
+        exist_ok=True
+    )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True
+    )
+
+    # ========================================================
+    # EXTRACT ZIP
+    # ========================================================
+
+    try:
+
+        with zipfile.ZipFile(
+            zip_path,
+            "r"
+        ) as archive:
+
+            archive.extractall(
+                extract_dir
+            )
+
+    except zipfile.BadZipFile:
+
+        raise ValueError(
+            "Invalid or corrupted ZIP file."
+        )
+
+    # ========================================================
+    # FIND IMAGES
+    # ========================================================
+
+    image_files = find_images(
+        extract_dir
+    )
+
+    total = len(
+        image_files
+    )
+
+    if total == 0:
+
+        raise ValueError(
+            "No supported images found in ZIP."
+        )
+
+    processed = 0
+    failed = 0
+    cancelled = False
+
+    # ========================================================
+    # PROCESS EACH IMAGE
+    # ========================================================
+
+    for index, input_path in enumerate(
+        image_files,
+        start=1
+    ):
+
+        # ----------------------------------------------------
+        # CHECK CANCEL
+        # ----------------------------------------------------
+
+        if cancel_callback:
+
+            try:
+
+                if cancel_callback():
+
+                    cancelled = True
+
+                    break
+
+            except Exception:
+
+                pass
+
+        # ----------------------------------------------------
+        # OUTPUT NAME
+        # ----------------------------------------------------
+
+        filename = os.path.basename(
+            input_path
+        )
+
+        name, extension = os.path.splitext(
+            filename
+        )
+
+        output_path = os.path.join(
+            output_dir,
+            f"{name}_4K.jpg"
+        )
+
+        # ----------------------------------------------------
+        # UPSCALE
+        # ----------------------------------------------------
+
+        try:
+
+            upscale_image(
+                input_path,
+                output_path,
+                max_4k=True
+            )
+
+            processed += 1
+
+        except Exception as e:
+
+            print(
+                f"[UPSCALE ERROR] "
+                f"{filename}: {e}"
+            )
+
+            failed += 1
+
+        # ----------------------------------------------------
+        # PROGRESS
+        # ----------------------------------------------------
+
+        percent = int(
+            (index / total) * 100
+        )
+
+        if progress_callback:
+
+            try:
+
+                progress_callback(
+                    percent,
+                    index,
+                    total
+                )
+
+            except Exception:
+
+                pass
+
+    # ========================================================
+    # CANCELLED
+    # ========================================================
+
+    if cancelled:
+
+        return (
+            None,
+            processed,
+            failed,
+            True
+        )
+
+    # ========================================================
+    # CHECK OUTPUT
+    # ========================================================
+
+    output_images = find_images(
+        output_dir
+    )
+
+    if not output_images:
+
+        return (
+            None,
+            processed,
+            failed,
+            False
+        )
+
+    # ========================================================
+    # CREATE OUTPUT ZIP
+    # ========================================================
+
+    output_zip = os.path.join(
+        user_dir,
+        f"{user_id}_4K_upscaled.zip"
+    )
+
+    try:
+
+        with zipfile.ZipFile(
+            output_zip,
+            "w",
+            compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+
+            for file_path in output_images:
+
+                archive.write(
+                    file_path,
+                    arcname=os.path.basename(
+                        file_path
+                    )
+                )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Failed to create output ZIP:\n{e}"
+        )
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
+    return (
+        output_zip,
+        processed,
+        failed,
+        False
+    )
 
 
 # ============================================================
@@ -317,7 +577,9 @@ if __name__ == "__main__":
 
     input_image = "input.jpg"
 
-    output_image = "output_4k.jpg"
+    output_image = (
+        "output_4K.jpg"
+    )
 
     result = upscale_image(
         input_image,
@@ -326,21 +588,5 @@ if __name__ == "__main__":
     )
 
     print(
-        "✅ Real-ESRGAN complete"
+        f"Upscaled image saved:\n{result}"
     )
-
-    print(
-        f"Output: {result}"
-    )
-
-    dimensions = get_image_dimensions(
-        result
-    )
-
-    if dimensions:
-
-        print(
-            f"Resolution: "
-            f"{dimensions['width']}×"
-            f"{dimensions['height']}"
-        )
