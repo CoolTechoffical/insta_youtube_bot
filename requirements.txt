@@ -7,5 +7,5 @@ flask
 yt-dlp
 torch
 torchvision
-basicsr
+basicsr==1.4.2
 realesrgan
