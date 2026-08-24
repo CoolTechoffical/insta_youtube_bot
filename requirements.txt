@@ -5,8 +5,3 @@ numpy
 pillow
 flask
 yt-dlp
-
-torch
-torchvision
-basicsr==1.4.2
-realesrgan
