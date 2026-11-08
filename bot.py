@@ -15,12 +15,13 @@ from upscale import (
     cleanup_user
 )
 from image_video import register_image_video_handlers
+register_image_video_handlers(bot)
 
 upscale_waiting = set()
 upscale_cancelled = set()
 upscale_caption_waiting = set()
 upscale_captions = {}
-register_image_video_handlers(bot)
+
 # ---------------- PATHS ----------------
 DOWNLOAD_DIR = "downloads"
 FRAME_DIR = "frames"
