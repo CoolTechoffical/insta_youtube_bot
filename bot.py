@@ -14,6 +14,7 @@ from upscale import (
     process_zip,
     cleanup_user
 )
+from image_video import register_image_video_handlers
 
 upscale_waiting = set()
 upscale_cancelled = set()
