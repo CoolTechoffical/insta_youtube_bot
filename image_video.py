@@ -7,18 +7,19 @@ import asyncio
 import queue
 import time
 import logging
+import math
+import random
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 from pyrogram import filters
 from pyrogram.handlers import MessageHandler
 
 
 # ---------------- LOGGING ----------------
 
-# CHANGE: explicit logger so every step shows in Render logs.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -42,9 +43,11 @@ MIN_IMAGE_DURATION = 0.65
 DEFAULT_IMAGE_DURATION = 1.2
 MAX_VIDEO_DURATION = 600
 
-# CHANGE: manual duration is DISABLED by default. Video length is always
-# derived automatically from the number of images.
-ALLOW_MANUAL_DURATION = False
+# Auto-finish after this many seconds of upload silence.
+AUTO_FINISH_SILENCE = 10.0
+
+# Auto-lite mode kicks in at this many images (skips particles / leaks).
+LITE_THRESHOLD = 30
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"}
@@ -62,6 +65,23 @@ def natural_sort_key(value):
         int(part) if part.isdigit() else part.lower()
         for part in re.split(r"(\d+)", str(value))
     ]
+
+
+def _has_transparency(path):
+    """Detect a logo candidate: PNG with a real alpha channel and some
+    transparent pixels. Returns True if it looks like a logo."""
+    try:
+        if Path(path).suffix.lower() != ".png":
+            return False
+        with Image.open(path) as im:
+            if im.mode not in ("RGBA", "LA"):
+                return False
+            alpha = np.array(im.convert("RGBA").split()[-1])
+            # At least 5% of pixels are transparent -> treat as logo.
+            return float((alpha < 32).mean()) > 0.05
+    except Exception as error:
+        log.warning("logo detect failed %s: %s", path, error)
+        return False
 
 
 def prepare_image(source, destination):
@@ -88,28 +108,105 @@ def prepare_image(source, destination):
         image.save(destination, "JPEG", quality=88, optimize=False)
 
 
-async def safe_download(message, path, retries=2):
-    """
-    Download a Telegram media file to `path` with a small retry loop.
-    Pyrogram writes `<path>.temp` then moves to `<path>`; on shared disks
-    that temp can vanish, so retry a couple of times.
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+def _analyze_image(path):
+    """Return simple image stats used for auto-mood/effect selection."""
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((256, 256))
+            arr = np.asarray(im, dtype=np.float32) / 255.0
+    except Exception:
+        return {
+            "brightness": 0.5, "saturation": 0.3, "warmth": 0.0,
+            "edge": 0.1, "portrait": False,
+        }
 
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    brightness = float(arr.mean())
+    max_c = arr.max(axis=-1)
+    min_c = arr.min(axis=-1)
+    sat = float(np.where(max_c > 0, (max_c - min_c) / (max_c + 1e-6), 0).mean())
+    warmth = float((r - b).mean())
+    gray = arr.mean(axis=-1)
+    gx = np.abs(np.diff(gray, axis=1)).mean()
+    gy = np.abs(np.diff(gray, axis=0)).mean()
+    edge = float(gx + gy)
+
+    return {
+        "brightness": brightness,
+        "saturation": sat,
+        "warmth": warmth,
+        "edge": edge,
+        "portrait": im.height > im.width,
+    }
+
+
+def _choose_mood(stats_list):
+    """Pick a mood from aggregate stats. 'romantic' is tasteful only:
+    warm tint, soft vignette, gentle zoom, decorative particles."""
+    if not stats_list:
+        return "cinematic"
+
+    avg_bright = sum(s["brightness"] for s in stats_list) / len(stats_list)
+    avg_sat = sum(s["saturation"] for s in stats_list) / len(stats_list)
+    avg_warm = sum(s["warmth"] for s in stats_list) / len(stats_list)
+    avg_edge = sum(s["edge"] for s in stats_list) / len(stats_list)
+    portrait_share = sum(1 for s in stats_list if s["portrait"]) / len(stats_list)
+
+    if avg_sat < 0.15:
+        return "mono"
+    if avg_warm > 0.03 and avg_sat > 0.25 and portrait_share > 0.5:
+        return "romantic"
+    if avg_edge > 0.09:
+        return "clean"
+    return "cinematic"
+
+
+def _choose_speed(count):
+    if count >= 40:
+        return 1.0
+    if count <= 5:
+        return 1.6
+    return DEFAULT_IMAGE_DURATION
+
+
+def _effect_for(stats, index):
+    """Per-image effect chosen from content + rotation index."""
+    rotation = ["zoom_in", "zoom_out", "pan_left", "pan_right", "ken_burns"]
+    if stats["portrait"]:
+        candidates = ["ken_burns", "pulse", "zoom_in", "zoom_out"]
+    else:
+        candidates = rotation
+    if stats["brightness"] < 0.25:
+        candidates = ["zoom_in"] + [c for c in candidates if c != "zoom_in"]
+    elif stats["brightness"] > 0.8:
+        candidates = ["zoom_out"] + [c for c in candidates if c != "zoom_out"]
+    return candidates[index % len(candidates)]
+
+
+def _transition_for(index, prev_stats, next_stats):
+    base = ["crossfade", "slide", "circle_reveal", "zoom_blur"]
+    if prev_stats and next_stats and prev_stats["edge"] > 0.09 and next_stats["edge"] > 0.09:
+        return "crossfade"
+    return base[index % len(base)]
+
+
+# ---------------- DOWNLOAD ----------------
+
+async def safe_download(message, path, retries=2):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     last_error = None
     for attempt in range(retries + 1):
         try:
-            log.info(
-                "download start msg=%s target=%s attempt=%s",
-                getattr(message, "id", "?"), path, attempt + 1,
-            )
+            log.info("download start msg=%s target=%s attempt=%s",
+                     getattr(message, "id", "?"), path, attempt + 1)
             result = await message.download(file_name=path)
             if result and os.path.exists(result):
-                size = os.path.getsize(result)
-                log.info("download ok msg=%s path=%s size=%s bytes",
-                         getattr(message, "id", "?"), result, size)
+                log.info("download ok msg=%s path=%s size=%s",
+                         getattr(message, "id", "?"), result,
+                         os.path.getsize(result))
                 return result
-            last_error = "Download produced no file."
+            last_error = "no file"
         except FileNotFoundError as error:
             last_error = error
             log.warning("download temp vanished msg=%s attempt=%s err=%s",
@@ -118,15 +215,13 @@ async def safe_download(message, path, retries=2):
             last_error = error
             log.warning("download error msg=%s attempt=%s err=%s",
                         getattr(message, "id", "?"), attempt + 1, error)
-
         await asyncio.sleep(0.5 * (attempt + 1))
-
-    log.error("download failed msg=%s path=%s last_error=%s",
+    log.error("download failed msg=%s path=%s err=%s",
               getattr(message, "id", "?"), path, last_error)
     return None
 
 
-# ---------------- ZIP EXTRACTION ----------------
+# ---------------- ZIP ----------------
 
 def extract_zip(zip_path, work):
     log.info("zip extract start path=%s", zip_path)
@@ -135,7 +230,6 @@ def extract_zip(zip_path, work):
 
     extracted = []
     total_size = 0
-
     with zipfile.ZipFile(zip_path) as archive:
         members = []
         for info in archive.infolist():
@@ -149,7 +243,6 @@ def extract_zip(zip_path, work):
             if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
             members.append(info)
-
         members.sort(key=lambda item: natural_sort_key(item.filename))
         log.info("zip members=%s", len(members))
 
@@ -160,10 +253,8 @@ def extract_zip(zip_path, work):
             total_size += info.file_size
             if total_size > MAX_EXTRACTED_SIZE:
                 raise ValueError("Extracted images exceed the 500 MB limit.")
-
             extension = Path(info.filename).suffix.lower()
             destination = os.path.join(work, f"source_{index:04d}{extension}")
-
             written = 0
             with archive.open(info) as source, open(destination, "wb") as output:
                 while True:
@@ -174,165 +265,390 @@ def extract_zip(zip_path, work):
                     if written > info.file_size or written > MAX_EXTRACTED_SIZE:
                         raise ValueError("Invalid or oversized ZIP entry.")
                     output.write(chunk)
-
             extracted.append((info.filename, destination))
-            log.info("zip extracted [%s/%s] %s -> %s (%s bytes)",
-                     index + 1, len(members), info.filename, destination, written)
+            log.info("zip extracted [%s/%s] %s (%s bytes)",
+                     index + 1, len(members), info.filename, written)
 
     if not extracted:
         raise ValueError("The ZIP file contains no supported images.")
-
-    log.info("zip extract done total=%s", len(extracted))
     return extracted
 
 
-# ---------------- IMAGE COLLECTION ----------------
+# ---------------- PREPARE ----------------
 
 def prepare_images(session):
     work = session["work"]
     sources = []
-
     if session.get("zip_path"):
         sources.extend(extract_zip(session["zip_path"], work))
-
     sources.extend(session["images"])
     sources.sort(key=lambda item: natural_sort_key(item[0]))
-
     log.info("prepare_images sources=%s", len(sources))
 
     if not sources:
         raise ValueError("No images uploaded.")
-
     if len(sources) > MAX_IMAGES:
         raise ValueError(f"Maximum {MAX_IMAGES} images allowed.")
 
     prepared = []
+    stats_list = []
     skipped = 0
-
     for index, (filename, source) in enumerate(sources):
         destination = os.path.join(work, f"image_{index:04d}.jpg")
         try:
             prepare_image(source, destination)
             prepared.append(destination)
+            stats_list.append(_analyze_image(destination))
             log.info("prepared [%s/%s] %s -> %s",
                      index + 1, len(sources), filename, destination)
         except Exception as error:
             skipped += 1
-            # CHANGE: print the *reason* for every skip, not just a silent drop.
             log.warning("skip invalid image [%s/%s] %s: %s",
                         index + 1, len(sources), filename, error)
 
     log.info("prepare_images done prepared=%s skipped=%s", len(prepared), skipped)
-
     if not prepared:
         raise ValueError("No valid images found.")
+    return prepared, stats_list
 
-    return prepared
+
+# ---------------- EFFECTS ----------------
+
+def _apply_mood_tint(frame, mood):
+    """Tasteful color grades. No explicit content, no sexualization."""
+    if mood == "romantic":
+        # Warm, dreamy grade + soft bloom on highlights.
+        b, g, r = cv2.split(frame.astype(np.float32))
+        r = np.clip(r * 1.10 + 8, 0, 255)
+        b = np.clip(b * 0.95, 0, 255)
+        frame = cv2.merge([b, g, r]).astype(np.uint8)
+        blurred = cv2.GaussianBlur(frame, (0, 0), 6)
+        frame = cv2.addWeighted(frame, 0.85, blurred, 0.15, 0)
+    elif mood == "cinematic":
+        b, g, r = cv2.split(frame.astype(np.float32))
+        r = np.clip(r * 1.05 + 4, 0, 255)
+        b = np.clip(b * 1.08 + 6, 0, 255)
+        frame = cv2.merge([b, g, r]).astype(np.uint8)
+    elif mood == "mono":
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    # 'clean' -> no tint
+    return frame
 
 
-# ---------------- LOW-RESOURCE VIDEO RENDERING ----------------
+def _apply_vignette(frame, strength=0.35):
+    h, w = frame.shape[:2]
+    y, x = np.ogrid[:h, :w]
+    cx, cy = w / 2, h / 2
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    mask = 1.0 - np.clip(r / (0.75 * max(cx, cy)), 0, 1) * strength
+    mask = np.dstack([mask] * 3)
+    return (frame.astype(np.float32) * mask).astype(np.uint8)
 
-def _make_frame(base, effect, frame_index, frame_count):
+
+def _apply_particles(frame, mood, frame_index, frame_count, lite):
+    if lite:
+        return frame
+    if mood not in ("romantic", "cinematic"):
+        return frame
+
+    h, w = frame.shape[:2]
+    overlay = np.zeros_like(frame)
+    rng = random.Random(1234 + frame_index // 4)
+
+    count = 25 if mood == "romantic" else 18
+    for _ in range(count):
+        px = rng.randint(0, w - 1)
+        py = rng.randint(0, h - 1)
+        radius = rng.choice([2, 3, 4])
+        if mood == "romantic":
+            color = (180, 190, 255)  # soft pinkish in BGR
+        else:
+            color = (200, 220, 255)
+        cv2.circle(overlay, (px, py), radius, color, -1)
+
+    overlay = cv2.GaussianBlur(overlay, (0, 0), 2)
+    return cv2.addWeighted(frame, 1.0, overlay, 0.35, 0)
+
+
+def _apply_light_leak(frame, frame_index, frame_count, lite):
+    if lite:
+        return frame
+    h, w = frame.shape[:2]
     progress = frame_index / max(1, frame_count - 1)
-    zoom = 1.0 + (0.07 * progress if effect == "zoom_in" else 0.07 * (1.0 - progress)
-                 if effect == "zoom_out" else 0.055)
+    band_x = int((progress * 1.4 - 0.2) * w)
+    band_w = int(w * 0.25)
+    x0 = max(0, band_x - band_w // 2)
+    x1 = min(w, band_x + band_w // 2)
+    if x1 <= x0:
+        return frame
+    overlay = frame.copy()
+    gradient = np.zeros((h, x1 - x0, 3), dtype=np.uint8)
+    gradient[..., 2] = 60  # warm red
+    gradient[..., 1] = 30
+    overlay[:, x0:x1] = cv2.add(overlay[:, x0:x1], gradient)
+    return cv2.addWeighted(frame, 0.9, overlay, 0.1, 0)
 
+
+def _crop_zoom(base, zoom, x_off, y_off):
     crop_w = max(2, int(WIDTH / zoom))
     crop_h = max(2, int(HEIGHT / zoom))
-
     max_x = max(0, WIDTH - crop_w)
     max_y = max(0, HEIGHT - crop_h)
+    x = int(max_x * x_off)
+    y = int(max_y * y_off)
+    x = max(0, min(x, max_x))
+    y = max(0, min(y, max_y))
+    return base[y:y + crop_h, x:x + crop_w]
 
-    if effect == "pan_left":
-        x = int(max_x * progress); y = (HEIGHT - crop_h) // 2
+
+def _make_frame(base, effect, frame_index, frame_count, mood, lite, logo=None, logo_phase=None):
+    progress = frame_index / max(1, frame_count - 1)
+
+    if effect == "zoom_in":
+        zoom, x_off, y_off = 1.0 + 0.07 * progress, 0.5, 0.5
+    elif effect == "zoom_out":
+        zoom, x_off, y_off = 1.07 - 0.07 * progress, 0.5, 0.5
+    elif effect == "ken_burns":
+        zoom = 1.0 + 0.06 * progress
+        x_off = 0.35 + 0.3 * progress
+        y_off = 0.4 + 0.2 * progress
+    elif effect == "pulse":
+        zoom = 1.0 + 0.04 * math.sin(progress * math.pi * 2)
+        x_off, y_off = 0.5, 0.5
+    elif effect == "pan_left":
+        zoom, x_off, y_off = 1.06, 1.0 - progress, 0.5
     elif effect == "pan_right":
-        x = int(max_x * (1.0 - progress)); y = (HEIGHT - crop_h) // 2
+        zoom, x_off, y_off = 1.06, progress, 0.5
     elif effect == "pan_up":
-        x = (WIDTH - crop_w) // 2; y = int(max_y * progress)
+        zoom, x_off, y_off = 1.06, 0.5, progress
     elif effect == "pan_down":
-        x = (WIDTH - crop_w) // 2; y = int(max_y * (1.0 - progress))
+        zoom, x_off, y_off = 1.06, 0.5, 1.0 - progress
     else:
-        x = (WIDTH - crop_w) // 2; y = (HEIGHT - crop_h) // 2
+        zoom, x_off, y_off = 1.0, 0.5, 0.5
 
-    x = max(0, min(x, WIDTH - crop_w))
-    y = max(0, min(y, HEIGHT - crop_h))
-    cropped = base[y:y + crop_h, x:x + crop_w]
+    zoom = max(1.0, zoom)
+    cropped = _crop_zoom(base, zoom, x_off, y_off)
     if cropped.size == 0:
         cropped = base
-
     frame = cv2.resize(cropped, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
 
     fade_frames = max(1, int(FPS * 0.16))
     fade_in = min(1.0, (frame_index + 1) / fade_frames)
     fade_out = min(1.0, (frame_count - frame_index) / fade_frames)
     alpha = min(fade_in, fade_out)
-
     if alpha < 1.0:
         frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
+
+    frame = _apply_mood_tint(frame, mood)
+    frame = _apply_vignette(frame, 0.35 if mood != "clean" else 0.15)
+    frame = _apply_particles(frame, mood, frame_index, frame_count, lite)
+    frame = _apply_light_leak(frame, frame_index, frame_count, lite)
+
+    if logo is not None and logo_phase == "intro":
+        frame = _blend_logo(frame, logo, frame_index, frame_count, mode="intro")
+    elif logo is not None and logo_phase == "corner":
+        frame = _blend_logo(frame, logo, frame_index, frame_count, mode="corner")
 
     return frame
 
 
-def render_video(images, output_path, total_seconds, progress_callback=None):
+def _blend_logo(frame, logo, frame_index, frame_count, mode):
+    if logo is None:
+        return frame
+    lh, lw = logo.shape[:2]
+    fh, fw = frame.shape[:2]
+
+    if mode == "intro":
+        progress = frame_index / max(1, frame_count - 1)
+        if progress < 0.15:
+            alpha = progress / 0.15
+        elif progress < 0.75:
+            alpha = 1.0
+        else:
+            alpha = max(0.0, 1.0 - (progress - 0.75) / 0.25)
+        scale = 0.35
+    else:
+        alpha = 0.55
+        scale = 0.14
+
+    target_w = int(fw * scale)
+    target_h = max(1, int(lh * (target_w / lw)))
+    lw2, lh2 = target_w, target_h
+    if lw2 <= 0 or lh2 <= 0 or lw2 >= fw or lh2 >= fh:
+        return frame
+    resized = cv2.resize(logo, (lw2, lh2), interpolation=cv2.INTER_AREA)
+
+    if mode == "intro":
+        x = (fw - lw2) // 2
+        y = (fh - lh2) // 2
+    else:
+        margin = int(fw * 0.02)
+        x = fw - lw2 - margin
+        y = fh - lh2 - margin
+
+    roi = frame[y:y + lh2, x:x + lw2]
+    if roi.shape[:2] != resized.shape[:2]:
+        return frame
+    bgr = resized[..., :3].astype(np.float32)
+    a = (resized[..., 3:4].astype(np.float32) / 255.0) * alpha
+    roi_f = roi.astype(np.float32)
+    blended = bgr * a + roi_f * (1 - a)
+    frame[y:y + lh2, x:x + lw2] = blended.astype(np.uint8)
+    return frame
+
+
+def _crossfade(a, b, t):
+    return cv2.addWeighted(a, 1 - t, b, t, 0)
+
+
+def _slide_transition(a, b, t, direction=1):
+    w = a.shape[1]
+    shift = int(w * t) * direction
+    out = a.copy()
+    if direction > 0:
+        out[:, :w - shift] = a[:, shift:]
+        out[:, w - shift:] = b[:, :shift]
+    else:
+        shift = abs(shift)
+        out[:, shift:] = a[:, :w - shift]
+        out[:, :shift] = b[:, w - shift:]
+    return out
+
+
+def _circle_reveal(a, b, t):
+    h, w = a.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    radius = int(math.sqrt((w / 2) ** 2 + (h / 2) ** 2) * t)
+    cv2.circle(mask, (w // 2, h // 2), max(1, radius), 255, -1)
+    mask3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
+    return (b.astype(np.float32) * mask3 + a.astype(np.float32) * (1 - mask3)).astype(np.uint8)
+
+
+def _zoom_blur_transition(a, b, t):
+    strength = 1.0 + 0.2 * math.sin(t * math.pi)
+    zoomed = cv2.resize(b, None, fx=strength, fy=strength,
+                        interpolation=cv2.INTER_LINEAR)
+    y0 = (zoomed.shape[0] - HEIGHT) // 2
+    x0 = (zoomed.shape[1] - WIDTH) // 2
+    zoomed = zoomed[y0:y0 + HEIGHT, x0:x0 + WIDTH]
+    if zoomed.shape[:2] != a.shape[:2]:
+        zoomed = cv2.resize(zoomed, (WIDTH, HEIGHT))
+    return _crossfade(a, zoomed, t)
+
+
+def _apply_transition(a, b, name, t):
+    if name == "slide":
+        return _slide_transition(a, b, t)
+    if name == "circle_reveal":
+        return _circle_reveal(a, b, t)
+    if name == "zoom_blur":
+        return _zoom_blur_transition(a, b, t)
+    return _crossfade(a, b, t)
+
+
+# ---------------- RENDER ----------------
+
+def render_video(images, stats_list, output_path, total_seconds,
+                 mood="cinematic", lite=False, logo_path=None,
+                 progress_callback=None):
     count = len(images)
-    log.info("render start images=%s target_seconds=%s output=%s",
-             count, total_seconds, output_path)
+    log.info("render start images=%s target=%.1fs mood=%s lite=%s logo=%s",
+             count, total_seconds, mood, lite, bool(logo_path))
     if count == 0:
         raise ValueError("No images available to render.")
 
-    duration = max(MIN_IMAGE_DURATION, float(total_seconds) / count)
-    frames_per_image = max(2, round(duration * FPS))
+    per_image = max(MIN_IMAGE_DURATION, float(total_seconds) / count)
+    frames_per_image = max(2, round(per_image * FPS))
     actual_duration = (frames_per_image * count) / FPS
-
-    log.info("render plan per_image=%.3fs frames_per_image=%s total_frames=%s "
-             "actual_duration=%.1fs",
-             duration, frames_per_image, frames_per_image * count, actual_duration)
+    log.info("render plan per=%.2fs frames=%s actual=%.1fs",
+             per_image, frames_per_image, actual_duration)
 
     if actual_duration > MAX_VIDEO_DURATION:
         raise ValueError("Video exceeds the 10-minute limit.")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, FPS, (WIDTH, HEIGHT))
-
+    writer = cv2.VideoWriter(output_path,
+                             cv2.VideoWriter_fourcc(*"mp4v"),
+                             FPS, (WIDTH, HEIGHT))
     if not writer.isOpened():
         writer.release()
-        raise RuntimeError(
-            "OpenCV could not open an MP4 video writer. "
-            "Check that opencv-python-headless is installed with MP4 codec support."
-        )
+        raise RuntimeError("OpenCV could not open MP4 writer.")
 
-    effects = ["zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
+    logo = None
+    if logo_path and os.path.exists(logo_path):
+        logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+        if logo is not None and (logo.ndim < 3 or logo.shape[2] != 4):
+            log.warning("logo missing alpha channel; ignoring logo")
+            logo = None
+        if logo is not None:
+            log.info("logo loaded shape=%s", logo.shape)
+
+    transition_frames = max(2, int(FPS * 0.25))
     total_frames = frames_per_image * count
-    completed_frames = 0
-    last_reported = -1
+    completed = 0
+    last_pct = -1
 
     try:
-        for image_index, image_path in enumerate(images):
+        prev_last_frame = None
+        prev_stats = None
+
+        for i, image_path in enumerate(images):
             base = cv2.imread(image_path, cv2.IMREAD_COLOR)
             if base is None:
-                log.warning("render skip unreadable image=%s", image_path)
+                log.warning("render skip unreadable %s", image_path)
                 continue
-
             if base.shape[1] != WIDTH or base.shape[0] != HEIGHT:
                 base = cv2.resize(base, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
 
-            effect = effects[image_index % len(effects)]
-            log.info("render image [%s/%s] effect=%s path=%s",
-                     image_index + 1, count, effect, image_path)
+            stats = stats_list[i] if i < len(stats_list) else {
+                "brightness": 0.5, "saturation": 0.3, "warmth": 0.0,
+                "edge": 0.1, "portrait": False,
+            }
+            effect = _effect_for(stats, i)
+            transition = _transition_for(i, prev_stats, stats)
+            log.info("render image [%s/%s] effect=%s transition=%s",
+                     i + 1, count, effect, transition)
 
-            for frame_index in range(frames_per_image):
-                frame = _make_frame(base, effect, frame_index, frames_per_image)
+            frames_buffer = []
+            for fi in range(frames_per_image):
+                # Intro logo overlay only on the first image.
+                logo_phase = None
+                if logo is not None and i == 0:
+                    logo_phase = "intro"
+                elif logo is not None:
+                    logo_phase = "corner"
+
+                frame = _make_frame(base, effect, fi, frames_per_image,
+                                    mood, lite, logo, logo_phase)
+                frames_buffer.append(frame)
+
+            if prev_last_frame is not None and len(frames_buffer) >= transition_frames:
+                for ti in range(transition_frames):
+                    t = (ti + 1) / (transition_frames + 1)
+                    blended = _apply_transition(
+                        prev_last_frame, frames_buffer[ti], transition, t
+                    )
+                    writer.write(blended)
+                    completed += 1
+                start_idx = transition_frames
+            else:
+                start_idx = 0
+
+            for frame in frames_buffer[start_idx:]:
                 writer.write(frame)
-                completed_frames += 1
+                completed += 1
 
-                percent = int((completed_frames / max(1, total_frames)) * 100)
-                if progress_callback and (percent >= last_reported + 5 or percent == 100):
-                    last_reported = percent
-                    log.info("render progress %s%% (frame %s/%s)",
-                             percent, completed_frames, total_frames)
-                    progress_callback(percent, image_index + 1, count)
+            prev_last_frame = frames_buffer[-1] if frames_buffer else None
+            prev_stats = stats
+
+            if progress_callback:
+                pct = int((completed / max(1, total_frames)) * 100)
+                if pct >= last_pct + 5 or pct == 100:
+                    last_pct = pct
+                    log.info("render progress %s%% (%s/%s)",
+                             pct, completed, total_frames)
+                    progress_callback(pct, i + 1, count)
 
             del base
 
@@ -340,342 +656,255 @@ def render_video(images, output_path, total_seconds, progress_callback=None):
         writer.release()
 
     size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-    log.info("render done path=%s size=%s bytes duration=%.1fs",
+    log.info("render done path=%s size=%s duration=%.1fs",
              output_path, size, actual_duration)
-
-    if not os.path.exists(output_path) or size < 1024:
+    if size < 1024:
         raise RuntimeError("Video rendering failed: output file is empty.")
-
     return actual_duration
 
 
-# ---------------- FINISH VIDEO ----------------
+# ---------------- AUTO-FINISH WATCHER ----------------
 
-async def finish_video(client, message):
-    if not message.from_user:
+async def _auto_finish_watcher(bot, user_id):
+    """Wait for AUTO_FINISH_SILENCE of upload silence, then render."""
+    try:
+        while True:
+            session = sessions.get(user_id)
+            if not session:
+                log.info("auto-finish cancelled user=%s (no session)", user_id)
+                return
+            if session.get("processing"):
+                return
+
+            last_activity = session.get("last_activity", 0)
+            idle = time.monotonic() - last_activity
+
+            lock = session.get("lock")
+            if lock and lock.locked():
+                # A download is in flight -> extend window.
+                session["last_activity"] = time.monotonic()
+                await asyncio.sleep(1.0)
+                continue
+
+            if idle >= AUTO_FINISH_SILENCE and (session["images"] or session.get("zip_path")):
+                log.info("auto-finish trigger user=%s idle=%.1fs images=%s",
+                         user_id, idle, len(session["images"]))
+                # Fake a message-like object; easier: call a helper.
+                await _run_auto_finish(bot, user_id, session.get("chat_id"))
+                return
+
+            await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
         return
+    except Exception as error:
+        log.exception("auto-finish watcher error user=%s: %s", user_id, error)
 
-    user_id = message.from_user.id
+
+async def _run_auto_finish(bot, user_id, chat_id):
     session = sessions.get(user_id)
-
-    if not session:
-        return await message.reply("Start with /imagevideo first.")
-
-    if session.get("processing"):
-        return await message.reply("Your video is already being created.")
+    if not session or session.get("processing"):
+        return
+    if not (session["images"] or session.get("zip_path")):
+        return
+    if not chat_id:
+        log.warning("auto-finish missing chat_id user=%s", user_id)
+        return
 
     lock = session.get("lock")
     if lock is None:
         lock = asyncio.Lock()
         session["lock"] = lock
-
-    if lock.locked():
-        return await message.reply(
-            "A file is still downloading. Please wait a moment and try again."
-        )
-
     async with lock:
         session["processing"] = True
 
-    log.info("finish_video start user=%s images=%s zip=%s",
-             user_id, len(session["images"]), bool(session.get("zip_path")))
-
-    status = await message.reply("🖼️ Checking uploaded images...")
+    status = await bot.send_message(chat_id, "🎬 Auto-rendering your video...")
     output = None
-
     try:
-        images = await asyncio.to_thread(prepare_images, session)
+        images, stats_list = await asyncio.to_thread(prepare_images, session)
         count = len(images)
+        mood = _choose_mood(stats_list)
+        lite = count >= LITE_THRESHOLD
+        per_image = _choose_speed(count)
+        requested_duration = min(float(MAX_VIDEO_DURATION),
+                                 max(5.0, count * per_image))
 
-        # CHANGE: manual duration is ignored by default -> always automatic.
-        if ALLOW_MANUAL_DURATION and session.get("duration") is not None:
-            requested_duration = float(session["duration"])
-            log.info("using manual duration=%s", requested_duration)
-        else:
-            requested_duration = max(5, count * DEFAULT_IMAGE_DURATION)
-            log.info("auto duration computed=%s for %s images",
-                     requested_duration, count)
+        # Silent overrides (plain text keywords the user typed earlier).
+        override_mood = session.get("override_mood")
+        if override_mood:
+            mood = override_mood
+        override_speed = session.get("override_speed")
+        if override_speed:
+            requested_duration = min(float(MAX_VIDEO_DURATION),
+                                     count * override_speed)
 
-        requested_duration = min(float(requested_duration), MAX_VIDEO_DURATION)
+        log.info("auto-render plan images=%s mood=%s lite=%s duration=%.1fs",
+                 count, mood, lite, requested_duration)
 
-        await status.edit(
-            "🎬 Preparing low-resource video render...\n\n"
+        await status.edit_text(
+            "🎬 Rendering...\n\n"
             f"📸 Images: {count}\n"
-            f"⏱️ Target duration: {int(requested_duration)} seconds\n"
-            f"🎞️ Resolution: {WIDTH}×{HEIGHT} at {FPS} FPS\n"
-            "⚙️ Renderer: OpenCV (no external FFmpeg command)\n"
-            "Progress: 0%"
+            f"🎨 Mood: {mood}\n"
+            f"⚡ Lite mode: {'on' if lite else 'off'}\n"
+            f"⏱️ Duration: ~{int(requested_duration)}s"
         )
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         output = os.path.join(OUTPUT_DIR, f"image_video_{user_id}.mp4")
 
         loop = asyncio.get_running_loop()
-        progress_queue = queue.Queue()
+        progress_q = queue.Queue()
 
-        def report_progress(percent, current_image, total_images):
-            loop.call_soon_threadsafe(
-                progress_queue.put_nowait,
-                (percent, current_image, total_images)
-            )
+        def report(pct, cur, total):
+            loop.call_soon_threadsafe(progress_q.put_nowait, (pct, cur, total))
 
         render_task = asyncio.create_task(
             asyncio.to_thread(
                 render_video,
-                images,
-                output,
-                requested_duration,
-                report_progress
+                images, stats_list, output, requested_duration,
+                mood, lite, session.get("logo_path"), report,
             )
         )
 
-        last_percent = -1
-        last_edit_time = 0
-
+        last_edit = 0
+        last_pct = -1
         while not render_task.done():
             try:
-                percent, current_image, total_images = await asyncio.wait_for(
-                    asyncio.to_thread(progress_queue.get, True, 2.0),
-                    timeout=2.5
+                pct, cur, total = await asyncio.wait_for(
+                    asyncio.to_thread(progress_q.get, True, 2.0), timeout=2.5
                 )
                 now = time.monotonic()
-                if percent != last_percent and (now - last_edit_time >= 1.5 or percent == 100):
-                    bar_filled = percent // 5
-                    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+                if pct != last_pct and (now - last_edit >= 1.5 or pct == 100):
+                    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
                     try:
-                        await status.edit(
-                            "🎬 Creating your video...\n\n"
-                            f"[{bar}] {percent}%\n"
-                            f"📸 Image: {current_image}/{total_images}\n"
-                            f"🎞️ {WIDTH}×{HEIGHT} · {FPS} FPS"
+                        await status.edit_text(
+                            "🎬 Rendering...\n\n"
+                            f"[{bar}] {pct}%\n"
+                            f"📸 Image: {cur}/{total}\n"
+                            f"🎨 Mood: {mood}"
                         )
-                        last_percent = percent
-                        last_edit_time = now
-                    except Exception as error:
-                        log.warning("status edit failed: %s", error)
+                        last_pct, last_edit = pct, now
+                    except Exception:
+                        pass
             except asyncio.TimeoutError:
                 continue
             except queue.Empty:
                 continue
 
-        actual_duration = await render_task
-        log.info("render_task returned duration=%.1fs", actual_duration)
+        duration = await render_task
 
-        await message.reply_video(
+        await bot.send_video(
+            chat_id,
             output,
             caption=(
                 "🎬 **Your video is ready!**\n\n"
                 f"📸 Images: {count}\n"
-                f"⏱️ Duration: {int(actual_duration)} seconds\n"
-                f"🎞️ Resolution: {WIDTH}×{HEIGHT} · {FPS} FPS\n"
-                "✨ Automatic pan, zoom and fade effects"
+                f"⏱️ Duration: {int(duration)}s\n"
+                f"🎨 Mood: {mood}\n"
+                f"🎞️ {WIDTH}×{HEIGHT} · {FPS} FPS"
             ),
-            supports_streaming=True
+            supports_streaming=True,
         )
-
-        await status.edit("✅ Video created successfully!")
-        log.info("finish_video success user=%s images=%s duration=%.1fs",
-                 user_id, count, actual_duration)
+        await status.edit_text("✅ Video created successfully!")
+        log.info("auto-render success user=%s images=%s duration=%.1fs",
+                 user_id, count, duration)
 
     except Exception as error:
-        log.exception("finish_video failed user=%s err=%s", user_id, error)
+        log.exception("auto-render failed user=%s: %s", user_id, error)
         try:
-            await status.edit(f"❌ Video creation failed:\n{str(error)[:1500]}")
+            await status.edit_text(f"❌ Render failed: {str(error)[:800]}")
         except Exception:
             pass
-
     finally:
         session = sessions.pop(user_id, None)
         if session:
             work = session.get("work")
             if work and os.path.isdir(work):
                 shutil.rmtree(work, ignore_errors=True)
-                log.info("cleanup work=%s", work)
-
         if output and os.path.exists(output):
             try:
                 os.remove(output)
-                log.info("cleanup output=%s", output)
-            except OSError as error:
-                log.warning("cleanup output failed: %s", error)
+            except OSError:
+                pass
 
 
-# ---------------- PYROGRAM HANDLERS ----------------
+# ---------------- SESSION ----------------
+
+async def _ensure_session(bot, message):
+    user_id = message.from_user.id
+    session = sessions.get(user_id)
+    if session:
+        return session
+
+    os.makedirs(WORK_DIR, exist_ok=True)
+    work = tempfile.mkdtemp(prefix=f"{user_id}_", dir=WORK_DIR)
+    session = {
+        "work": work,
+        "images": [],
+        "zip_path": None,
+        "logo_path": None,
+        "processing": False,
+        "lock": asyncio.Lock(),
+        "last_activity": time.monotonic(),
+        "chat_id": message.chat.id,
+        "override_mood": None,
+        "override_speed": None,
+    }
+    sessions[user_id] = session
+    log.info("session created user=%s work=%s", user_id, work)
+
+    asyncio.create_task(_auto_finish_watcher(bot, user_id))
+    return session
+
+
+def _bump_activity(session):
+    session["last_activity"] = time.monotonic()
+
+
+# ---------------- HANDLERS ----------------
 
 def register_image_video_handlers(bot):
 
-    async def start(_, message):
+    async def on_photo(_, message):
         if not message.from_user:
             return
-
-        user_id = message.from_user.id
-        old = sessions.get(user_id)
-
-        if old:
-            if old.get("processing"):
-                return await message.reply(
-                    "A video is currently being created. "
-                    "Wait for it to finish or use /cancelvideo."
-                )
-            old_lock = old.get("lock")
-            if old_lock and old_lock.locked():
-                return await message.reply(
-                    "A file is still downloading. Please wait a moment and "
-                    "then run /imagevideo again."
-                )
-
-        # Manual duration is accepted as a command arg but ignored unless
-        # ALLOW_MANUAL_DURATION is True.
-        duration = None
-        if len(message.command) > 1:
-            try:
-                duration = float(message.command[1])
-                if not 5 <= duration <= MAX_VIDEO_DURATION:
-                    raise ValueError
-            except ValueError:
-                return await message.reply(
-                    "Usage: /imagevideo 90\n"
-                    "Duration must be 5–600 seconds."
-                )
-            if not ALLOW_MANUAL_DURATION:
-                log.info("manual duration ignored (auto mode enabled)")
-
-        old = sessions.pop(user_id, None)
-        if old:
-            old_work = old.get("work")
-            if old_work and os.path.isdir(old_work):
-                shutil.rmtree(old_work, ignore_errors=True)
-                log.info("reset old work=%s", old_work)
-
-        os.makedirs(WORK_DIR, exist_ok=True)
-        work = tempfile.mkdtemp(prefix=f"{user_id}_", dir=WORK_DIR)
-
-        sessions[user_id] = {
-            "work": work,
-            "images": [],
-            "zip_path": None,
-            "duration": duration,
-            "processing": False,
-            "lock": asyncio.Lock(),
-            # CHANGE: single status message so "Image added" updates in place
-            # instead of spamming a new reply every time.
-            "status_message": None,
-            "status_text": "",
-        }
-
-        log.info("session started user=%s work=%s", user_id, work)
-
-        await message.reply(
-            "🎬 **Image to Video Creator**\n\n"
-            "Send one ZIP file OR individual images.\n\n"
-            "📸 Maximum: 300 images\n"
-            "🎞️ Output: 720p · 15 FPS\n"
-            "✨ Automatic pan, zoom and fade effects\n"
-            "⏱️ Duration: Automatic (based on image count)\n\n"
-            "Commands:\n"
-            "/ivmusic - Check audio support\n"
-            "/finishvideo - Create video\n"
-            "/cancelvideo - Cancel session"
-        )
-
-    async def _update_image_status(session, bot, chat_id, new_line):
-        """
-        CHANGE: keep ONE status message per session and edit it, so users
-        don't get "✅ Image added" spammed for every upload.
-        """
-        status_message = session.get("status_message")
-        lines = session.get("status_lines") or []
-        lines.append(new_line)
-
-        # Show only the last 10 lines to keep the message tidy.
-        preview = lines[-10:]
-        text = (
-            "📥 **Receiving images**\n\n"
-            + "\n".join(preview)
-            + f"\n\n📸 Total: {len(session['images'])}/{MAX_IMAGES}"
-        )
-        session["status_lines"] = lines
-
-        try:
-            if status_message is None:
-                status_message = await bot.send_message(chat_id, text)
-                session["status_message"] = status_message
-            else:
-                await status_message.edit_text(text)
-        except Exception as error:
-            log.warning("image status update failed: %s", error)
-
-    async def receive_photo(_, message):
-        if not message.from_user:
+        session = await _ensure_session(bot, message)
+        if session.get("processing"):
             return
+        _bump_activity(session)
 
-        session = sessions.get(message.from_user.id)
-        if not session or session.get("processing"):
-            return
-
-        lock = session.get("lock")
-        if lock is None:
-            lock = asyncio.Lock()
-            session["lock"] = lock
-
-        async with lock:
-            if session.get("processing"):
-                return
-            if session.get("zip_path"):
-                return await message.reply("You already sent a ZIP file.")
+        async with session["lock"]:
             if len(session["images"]) >= MAX_IMAGES:
                 return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
-
             filename = f"photo_{message.id}.jpg"
             path = os.path.join(session["work"], filename)
-
-            log.info("photo received user=%s msg=%s -> %s",
-                     message.from_user.id, message.id, path)
-
             result = await safe_download(message, path)
             if not result:
-                return await message.reply(
-                    "⚠️ Could not download that image. Please resend it."
-                )
-
+                return await message.reply("⚠️ Could not download, please resend.")
             session["images"].append((filename, result))
-            total = len(session["images"])
-            log.info("photo stored user=%s total=%s", message.from_user.id, total)
-
-            # CHANGE: edit the single status message instead of new replies.
-            await _update_image_status(
-                session, bot, message.chat.id,
-                f"✅ {filename} → {total}/{MAX_IMAGES}"
+            _bump_activity(session)
+            log.info("photo stored user=%s total=%s",
+                     message.from_user.id, len(session["images"]))
+            await message.reply(
+                f"📥 {len(session['images'])} image(s) received "
+                f"(auto-render after {int(AUTO_FINISH_SILENCE)}s silence)"
             )
 
-    async def receive_document(_, message):
+    async def on_document(_, message):
         if not message.from_user or not message.document:
             return
-
-        session = sessions.get(message.from_user.id)
-        if not session or session.get("processing"):
+        session = await _ensure_session(bot, message)
+        if session.get("processing"):
             return
+        _bump_activity(session)
 
-        lock = session.get("lock")
-        if lock is None:
-            lock = asyncio.Lock()
-            session["lock"] = lock
+        filename = message.document.file_name or "upload"
+        extension = Path(filename).suffix.lower()
+        file_size = message.document.file_size or 0
 
-        async with lock:
-            if session.get("processing"):
-                return
-
-            filename = message.document.file_name or "upload"
-            extension = Path(filename).suffix.lower()
-            file_size = message.document.file_size or 0
-
-            log.info("document received user=%s msg=%s name=%s size=%s",
-                     message.from_user.id, message.id, filename, file_size)
-
+        async with session["lock"]:
             if extension in AUDIO_EXTENSIONS:
                 return await message.reply(
-                    "🎵 Background music is not available in this lightweight "
-                    "OpenCV-only version. Video creation will continue without audio."
+                    "🎵 Background music is disabled in this lightweight build."
                 )
 
             if extension == ".zip":
@@ -683,92 +912,92 @@ def register_image_video_handlers(bot):
                     return await message.reply("Use one ZIP OR individual images.")
                 if file_size > MAX_ZIP_SIZE:
                     return await message.reply("ZIP limit is 100 MB.")
-
                 path = os.path.join(session["work"], f"images_{message.id}.zip")
                 result = await safe_download(message, path)
                 if not result:
-                    return await message.reply(
-                        "⚠️ Could not download that ZIP. Please resend it."
-                    )
+                    return await message.reply("⚠️ ZIP download failed.")
                 session["zip_path"] = result
-                log.info("zip stored user=%s path=%s",
-                         message.from_user.id, result)
+                _bump_activity(session)
+                log.info("zip stored user=%s path=%s", message.from_user.id, result)
                 return await message.reply(
-                    "📦 ZIP received. Send /finishvideo when ready."
+                    f"📦 ZIP received (auto-render after {int(AUTO_FINISH_SILENCE)}s silence)"
                 )
 
             if extension not in IMAGE_EXTENSIONS:
                 return
 
-            if session.get("zip_path"):
-                return await message.reply("You already sent a ZIP file.")
-            if len(session["images"]) >= MAX_IMAGES:
-                return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
-
-            unique_name = f"document_{message.id}{extension}"
-            path = os.path.join(session["work"], unique_name)
-
+            path = os.path.join(session["work"], f"document_{message.id}{extension}")
             result = await safe_download(message, path)
             if not result:
-                return await message.reply(
-                    "⚠️ Could not download that file. Please resend it."
-                )
+                return await message.reply("⚠️ Download failed, please resend.")
 
+            # Auto-detect logo (transparent PNG).
+            if session.get("logo_path") is None and _has_transparency(result):
+                session["logo_path"] = result
+                _bump_activity(session)
+                log.info("logo detected user=%s path=%s",
+                         message.from_user.id, result)
+                return await message.reply("🖼️ Logo detected and saved.")
+
+            if len(session["images"]) >= MAX_IMAGES:
+                return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
             session["images"].append((filename, result))
-            total = len(session["images"])
-            log.info("document stored user=%s total=%s", message.from_user.id, total)
-
-            await _update_image_status(
-                session, bot, message.chat.id,
-                f"✅ {filename} → {total}/{MAX_IMAGES}"
+            _bump_activity(session)
+            log.info("document stored user=%s total=%s",
+                     message.from_user.id, len(session["images"]))
+            await message.reply(
+                f"📥 {len(session['images'])} image(s) received "
+                f"(auto-render after {int(AUTO_FINISH_SILENCE)}s silence)"
             )
 
-    async def finish(_, message):
-        await finish_video(bot, message)
-
-    async def cancel(_, message):
-        if not message.from_user:
+    async def on_text(_, message):
+        """Silent keyword overrides + finish/cancel triggers.
+        No slash commands required."""
+        if not message.from_user or not message.text:
             return
-
         session = sessions.get(message.from_user.id)
-        if not session:
-            return await message.reply("No active session.")
-
-        if session.get("processing"):
-            return await message.reply(
-                "Video rendering is already running. Please wait for it to finish."
-            )
-
-        lock = session.get("lock")
-        if lock and lock.locked():
-            return await message.reply(
-                "A file is still downloading. Try /cancelvideo again in a moment."
-            )
-
-        sessions.pop(message.from_user.id, None)
-        work = session.get("work")
-        if work and os.path.isdir(work):
-            shutil.rmtree(work, ignore_errors=True)
-        log.info("session cancelled user=%s", message.from_user.id)
-        await message.reply("🛑 Image-to-video session cancelled.")
-
-    async def add_music(_, message):
-        if not message.from_user:
+        if not session or session.get("processing"):
             return
-        if message.from_user.id not in sessions:
-            return await message.reply("Start with /imagevideo first.")
-        await message.reply(
-            "🎵 Music muxing is disabled in this lightweight version so the "
-            "server does not need an external FFmpeg command. The video will "
-            "be created without background audio."
-        )
+
+        text = message.text.strip().lower()
+        _bump_activity(session)
+
+        if text in {"cancel", "stop", "x"}:
+            sessions.pop(message.from_user.id, None)
+            work = session.get("work")
+            if work and os.path.isdir(work):
+                shutil.rmtree(work, ignore_errors=True)
+            log.info("user cancel user=%s", message.from_user.id)
+            return await message.reply("🛑 Cancelled.")
+
+        if text in {"finish", "done", "go", "render"}:
+            return await _run_auto_finish(bot, message.from_user.id, message.chat.id)
+
+        mood_map = {
+            "romantic": "romantic",
+            "cinematic": "cinematic",
+            "mono": "mono",
+            "bw": "mono",
+            "clean": "clean",
+        }
+        if text in mood_map:
+            session["override_mood"] = mood_map[text]
+            return await message.reply(f"🎨 Mood set to {mood_map[text]}.")
+
+        if text == "fast":
+            session["override_speed"] = 1.0
+            return await message.reply("⚡ Speed: fast.")
+        if text == "slow":
+            session["override_speed"] = 1.6
+            return await message.reply("🐢 Speed: slow.")
+        if text == "normal":
+            session["override_speed"] = DEFAULT_IMAGE_DURATION
+            return await message.reply("▶️ Speed: normal.")
 
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    bot.add_handler(MessageHandler(start, filters.command("imagevideo")), group=1)
-    bot.add_handler(MessageHandler(finish, filters.command("finishvideo")), group=1)
-    bot.add_handler(MessageHandler(cancel, filters.command("cancelvideo")), group=1)
-    bot.add_handler(MessageHandler(add_music, filters.command("ivmusic")), group=1)
-    bot.add_handler(MessageHandler(receive_photo, filters.photo), group=1)
-    bot.add_handler(MessageHandler(receive_document, filters.document), group=1)
+    bot.add_handler(MessageHandler(on_photo, filters.photo), group=1)
+    bot.add_handler(MessageHandler(on_document, filters.document), group=1)
+    bot.add_handler(MessageHandler(on_text, filters.text), group=1)
+    log.info("image_video handlers registered")
