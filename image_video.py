@@ -73,6 +73,37 @@ def prepare_image(source, destination):
         image.save(destination, "JPEG", quality=88, optimize=False)
 
 
+async def safe_download(message, path, retries=2):
+    """
+    Download a Telegram media file to `path` with a small retry loop.
+
+    Pyrogram downloads to `<path>.temp` and then moves it to `<path>`.
+    On shared/ephemeral filesystems (Render, etc.) that temp file can
+    disappear mid-flight if another handler cleans the parent directory
+    or if two handlers collide on the same name. Retrying once or twice
+    handles the transient case cleanly.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            result = await message.download(file_name=path)
+            if result and os.path.exists(result):
+                return result
+            last_error = "Download produced no file."
+        except FileNotFoundError as error:
+            last_error = error
+        except Exception as error:  # noqa: BLE001 - surface as retryable
+            last_error = error
+
+        # Small backoff before retrying
+        await asyncio.sleep(0.5 * (attempt + 1))
+
+    print(f"Download failed for {path}: {last_error}")
+    return None
+
+
 # ---------------- ZIP EXTRACTION ----------------
 
 def extract_zip(zip_path, work):
@@ -306,7 +337,20 @@ async def finish_video(client, message):
     if session.get("processing"):
         return await message.reply("Your video is already being created.")
 
-    session["processing"] = True
+    # Take the session lock so no photo can land mid-render.
+    lock = session.get("lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        session["lock"] = lock
+
+    if lock.locked():
+        return await message.reply(
+            "A file is still downloading. Please wait a moment and try again."
+        )
+
+    async with lock:
+        session["processing"] = True
+
     status = await message.reply("🖼️ Checking uploaded images...")
     output = None
 
@@ -403,8 +447,11 @@ async def finish_video(client, message):
             pass
 
     finally:
-        sessions.pop(user_id, None)
-        shutil.rmtree(session["work"], ignore_errors=True)
+        session = sessions.pop(user_id, None)
+        if session:
+            work = session.get("work")
+            if work and os.path.isdir(work):
+                shutil.rmtree(work, ignore_errors=True)
 
         if output and os.path.exists(output):
             try:
@@ -422,10 +469,20 @@ def register_image_video_handlers(bot):
             return
 
         user_id = message.from_user.id
-        old = sessions.pop(user_id, None)
+        old = sessions.get(user_id)
 
         if old:
-            shutil.rmtree(old["work"], ignore_errors=True)
+            if old.get("processing"):
+                return await message.reply(
+                    "A video is currently being created. "
+                    "Wait for it to finish or use /cancelvideo."
+                )
+            old_lock = old.get("lock")
+            if old_lock and old_lock.locked():
+                return await message.reply(
+                    "A file is still downloading. Please wait a moment and "
+                    "then run /imagevideo again."
+                )
 
         duration = None
         if len(message.command) > 1:
@@ -439,6 +496,13 @@ def register_image_video_handlers(bot):
                     "Duration must be 5–600 seconds."
                 )
 
+        # Safe to drop the previous session now.
+        old = sessions.pop(user_id, None)
+        if old:
+            old_work = old.get("work")
+            if old_work and os.path.isdir(old_work):
+                shutil.rmtree(old_work, ignore_errors=True)
+
         os.makedirs(WORK_DIR, exist_ok=True)
         work = tempfile.mkdtemp(prefix=f"{user_id}_", dir=WORK_DIR)
 
@@ -447,7 +511,8 @@ def register_image_video_handlers(bot):
             "images": [],
             "zip_path": None,
             "duration": duration,
-            "processing": False
+            "processing": False,
+            "lock": asyncio.Lock(),
         }
 
         await message.reply(
@@ -472,19 +537,35 @@ def register_image_video_handlers(bot):
         if not session or session.get("processing"):
             return
 
-        if session["zip_path"]:
-            return await message.reply("You already sent a ZIP file.")
+        lock = session.get("lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            session["lock"] = lock
 
-        if len(session["images"]) >= MAX_IMAGES:
-            return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
+        async with lock:
+            # Re-check after acquiring the lock: state may have changed.
+            if session.get("processing"):
+                return
+            if session.get("zip_path"):
+                return await message.reply("You already sent a ZIP file.")
+            if len(session["images"]) >= MAX_IMAGES:
+                return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
 
-        index = len(session["images"]) + 1
-        filename = f"photo_{index:04d}.jpg"
-        path = os.path.join(session["work"], filename)
+            # Unique per-message filename avoids temp collisions when
+            # multiple photos arrive close together.
+            filename = f"photo_{message.id}.jpg"
+            path = os.path.join(session["work"], filename)
 
-        await message.download(file_name=path)
-        session["images"].append((filename, path))
-        await message.reply(f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}")
+            result = await safe_download(message, path)
+            if not result:
+                return await message.reply(
+                    "⚠️ Could not download that image. Please resend it."
+                )
+
+            session["images"].append((filename, result))
+            await message.reply(
+                f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}"
+            )
 
     async def receive_document(_, message):
         if not message.from_user or not message.document:
@@ -494,44 +575,67 @@ def register_image_video_handlers(bot):
         if not session or session.get("processing"):
             return
 
-        filename = message.document.file_name or "upload"
-        extension = Path(filename).suffix.lower()
-        file_size = message.document.file_size or 0
+        lock = session.get("lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            session["lock"] = lock
 
-        if extension in AUDIO_EXTENSIONS:
-            return await message.reply(
-                "🎵 Background music is not available in this lightweight "
-                "OpenCV-only version. Video creation will continue without audio."
+        async with lock:
+            if session.get("processing"):
+                return
+
+            filename = message.document.file_name or "upload"
+            extension = Path(filename).suffix.lower()
+            file_size = message.document.file_size or 0
+
+            if extension in AUDIO_EXTENSIONS:
+                return await message.reply(
+                    "🎵 Background music is not available in this lightweight "
+                    "OpenCV-only version. Video creation will continue without audio."
+                )
+
+            if extension == ".zip":
+                if session["images"] or session.get("zip_path"):
+                    return await message.reply(
+                        "Use one ZIP OR individual images."
+                    )
+                if file_size > MAX_ZIP_SIZE:
+                    return await message.reply("ZIP limit is 100 MB.")
+
+                path = os.path.join(session["work"], f"images_{message.id}.zip")
+                result = await safe_download(message, path)
+                if not result:
+                    return await message.reply(
+                        "⚠️ Could not download that ZIP. Please resend it."
+                    )
+
+                session["zip_path"] = result
+                return await message.reply(
+                    "📦 ZIP received. Send /finishvideo when ready."
+                )
+
+            if extension not in IMAGE_EXTENSIONS:
+                return
+
+            if session.get("zip_path"):
+                return await message.reply("You already sent a ZIP file.")
+
+            if len(session["images"]) >= MAX_IMAGES:
+                return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
+
+            unique_name = f"document_{message.id}{extension}"
+            path = os.path.join(session["work"], unique_name)
+
+            result = await safe_download(message, path)
+            if not result:
+                return await message.reply(
+                    "⚠️ Could not download that file. Please resend it."
+                )
+
+            session["images"].append((filename, result))
+            await message.reply(
+                f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}"
             )
-
-        if extension == ".zip":
-            if session["images"] or session["zip_path"]:
-                return await message.reply("Use one ZIP OR individual images.")
-
-            if file_size > MAX_ZIP_SIZE:
-                return await message.reply("ZIP limit is 100 MB.")
-
-            path = os.path.join(session["work"], "images.zip")
-            await message.download(file_name=path)
-            session["zip_path"] = path
-            return await message.reply("📦 ZIP received. Send /finishvideo when ready.")
-
-        if extension not in IMAGE_EXTENSIONS:
-            return
-
-        if session["zip_path"]:
-            return await message.reply("You already sent a ZIP file.")
-
-        if len(session["images"]) >= MAX_IMAGES:
-            return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
-
-        path = os.path.join(
-            session["work"],
-            f"document_{len(session['images']) + 1:04d}{extension}"
-        )
-        await message.download(file_name=path)
-        session["images"].append((filename, path))
-        await message.reply(f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}")
 
     async def finish(_, message):
         await finish_video(bot, message)
@@ -549,8 +653,16 @@ def register_image_video_handlers(bot):
                 "Video rendering is already running. Please wait for it to finish."
             )
 
+        lock = session.get("lock")
+        if lock and lock.locked():
+            return await message.reply(
+                "A file is still downloading. Try /cancelvideo again in a moment."
+            )
+
         sessions.pop(message.from_user.id, None)
-        shutil.rmtree(session["work"], ignore_errors=True)
+        work = session.get("work")
+        if work and os.path.isdir(work):
+            shutil.rmtree(work, ignore_errors=True)
         await message.reply("🛑 Image-to-video session cancelled.")
 
     async def add_music(_, message):
