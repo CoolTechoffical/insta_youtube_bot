@@ -6,6 +6,7 @@ import tempfile
 import asyncio
 import queue
 import time
+import logging
 from pathlib import Path
 
 import cv2
@@ -15,6 +16,17 @@ from pyrogram import filters
 from pyrogram.handlers import MessageHandler
 
 
+# ---------------- LOGGING ----------------
+
+# CHANGE: explicit logger so every step shows in Render logs.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("image_video")
+
+
 # ---------------- CONFIGURATION ----------------
 
 MAX_IMAGES = 300
@@ -22,7 +34,6 @@ MAX_ZIP_SIZE = 100 * 1024 * 1024
 MAX_EXTRACTED_SIZE = 500 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
 
-# 720p / 15 FPS keeps CPU and memory use much lower than the old 1080p/30 FPS
 WIDTH = 1280
 HEIGHT = 720
 FPS = 15
@@ -30,6 +41,10 @@ FPS = 15
 MIN_IMAGE_DURATION = 0.65
 DEFAULT_IMAGE_DURATION = 1.2
 MAX_VIDEO_DURATION = 600
+
+# CHANGE: manual duration is DISABLED by default. Video length is always
+# derived automatically from the number of images.
+ALLOW_MANUAL_DURATION = False
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"}
@@ -76,37 +91,45 @@ def prepare_image(source, destination):
 async def safe_download(message, path, retries=2):
     """
     Download a Telegram media file to `path` with a small retry loop.
-
-    Pyrogram downloads to `<path>.temp` and then moves it to `<path>`.
-    On shared/ephemeral filesystems (Render, etc.) that temp file can
-    disappear mid-flight if another handler cleans the parent directory
-    or if two handlers collide on the same name. Retrying once or twice
-    handles the transient case cleanly.
+    Pyrogram writes `<path>.temp` then moves to `<path>`; on shared disks
+    that temp can vanish, so retry a couple of times.
     """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     last_error = None
     for attempt in range(retries + 1):
         try:
+            log.info(
+                "download start msg=%s target=%s attempt=%s",
+                getattr(message, "id", "?"), path, attempt + 1,
+            )
             result = await message.download(file_name=path)
             if result and os.path.exists(result):
+                size = os.path.getsize(result)
+                log.info("download ok msg=%s path=%s size=%s bytes",
+                         getattr(message, "id", "?"), result, size)
                 return result
             last_error = "Download produced no file."
         except FileNotFoundError as error:
             last_error = error
-        except Exception as error:  # noqa: BLE001 - surface as retryable
+            log.warning("download temp vanished msg=%s attempt=%s err=%s",
+                        getattr(message, "id", "?"), attempt + 1, error)
+        except Exception as error:  # noqa: BLE001
             last_error = error
+            log.warning("download error msg=%s attempt=%s err=%s",
+                        getattr(message, "id", "?"), attempt + 1, error)
 
-        # Small backoff before retrying
         await asyncio.sleep(0.5 * (attempt + 1))
 
-    print(f"Download failed for {path}: {last_error}")
+    log.error("download failed msg=%s path=%s last_error=%s",
+              getattr(message, "id", "?"), path, last_error)
     return None
 
 
 # ---------------- ZIP EXTRACTION ----------------
 
 def extract_zip(zip_path, work):
+    log.info("zip extract start path=%s", zip_path)
     if os.path.getsize(zip_path) > MAX_ZIP_SIZE:
         raise ValueError("ZIP file exceeds the 100 MB limit.")
 
@@ -115,24 +138,20 @@ def extract_zip(zip_path, work):
 
     with zipfile.ZipFile(zip_path) as archive:
         members = []
-
         for info in archive.infolist():
             if info.is_dir():
                 continue
-
             filename = info.filename.replace("\\", "/")
             parts = Path(filename).parts
-
-            # Reject absolute paths and path traversal.
             if filename.startswith("/") or ".." in parts:
+                log.warning("zip skip unsafe path: %s", filename)
                 continue
-
             if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
-
             members.append(info)
 
         members.sort(key=lambda item: natural_sort_key(item.filename))
+        log.info("zip members=%s", len(members))
 
         if len(members) > MAX_IMAGES:
             raise ValueError(f"Maximum {MAX_IMAGES} images allowed.")
@@ -145,7 +164,6 @@ def extract_zip(zip_path, work):
             extension = Path(info.filename).suffix.lower()
             destination = os.path.join(work, f"source_{index:04d}{extension}")
 
-            # Stream each file to disk; do not load the ZIP into RAM.
             written = 0
             with archive.open(info) as source, open(destination, "wb") as output:
                 while True:
@@ -158,10 +176,13 @@ def extract_zip(zip_path, work):
                     output.write(chunk)
 
             extracted.append((info.filename, destination))
+            log.info("zip extracted [%s/%s] %s -> %s (%s bytes)",
+                     index + 1, len(members), info.filename, destination, written)
 
     if not extracted:
         raise ValueError("The ZIP file contains no supported images.")
 
+    log.info("zip extract done total=%s", len(extracted))
     return extracted
 
 
@@ -177,6 +198,8 @@ def prepare_images(session):
     sources.extend(session["images"])
     sources.sort(key=lambda item: natural_sort_key(item[0]))
 
+    log.info("prepare_images sources=%s", len(sources))
+
     if not sources:
         raise ValueError("No images uploaded.")
 
@@ -184,14 +207,22 @@ def prepare_images(session):
         raise ValueError(f"Maximum {MAX_IMAGES} images allowed.")
 
     prepared = []
+    skipped = 0
 
     for index, (filename, source) in enumerate(sources):
         destination = os.path.join(work, f"image_{index:04d}.jpg")
         try:
             prepare_image(source, destination)
             prepared.append(destination)
+            log.info("prepared [%s/%s] %s -> %s",
+                     index + 1, len(sources), filename, destination)
         except Exception as error:
-            print(f"Skipping invalid image {filename}: {error}")
+            skipped += 1
+            # CHANGE: print the *reason* for every skip, not just a silent drop.
+            log.warning("skip invalid image [%s/%s] %s: %s",
+                        index + 1, len(sources), filename, error)
+
+    log.info("prepare_images done prepared=%s skipped=%s", len(prepared), skipped)
 
     if not prepared:
         raise ValueError("No valid images found.")
@@ -202,10 +233,6 @@ def prepare_images(session):
 # ---------------- LOW-RESOURCE VIDEO RENDERING ----------------
 
 def _make_frame(base, effect, frame_index, frame_count):
-    """
-    Create one output frame at a time.
-    Only a single 720p frame is held in memory; no video-sized frame list.
-    """
     progress = frame_index / max(1, frame_count - 1)
     zoom = 1.0 + (0.07 * progress if effect == "zoom_in" else 0.07 * (1.0 - progress)
                  if effect == "zoom_out" else 0.055)
@@ -217,32 +244,24 @@ def _make_frame(base, effect, frame_index, frame_count):
     max_y = max(0, HEIGHT - crop_h)
 
     if effect == "pan_left":
-        x = int(max_x * progress)
-        y = (HEIGHT - crop_h) // 2
+        x = int(max_x * progress); y = (HEIGHT - crop_h) // 2
     elif effect == "pan_right":
-        x = int(max_x * (1.0 - progress))
-        y = (HEIGHT - crop_h) // 2
+        x = int(max_x * (1.0 - progress)); y = (HEIGHT - crop_h) // 2
     elif effect == "pan_up":
-        x = (WIDTH - crop_w) // 2
-        y = int(max_y * progress)
+        x = (WIDTH - crop_w) // 2; y = int(max_y * progress)
     elif effect == "pan_down":
-        x = (WIDTH - crop_w) // 2
-        y = int(max_y * (1.0 - progress))
+        x = (WIDTH - crop_w) // 2; y = int(max_y * (1.0 - progress))
     else:
-        x = (WIDTH - crop_w) // 2
-        y = (HEIGHT - crop_h) // 2
+        x = (WIDTH - crop_w) // 2; y = (HEIGHT - crop_h) // 2
 
-    # The crop dimensions are never larger than the source image.
     x = max(0, min(x, WIDTH - crop_w))
     y = max(0, min(y, HEIGHT - crop_h))
     cropped = base[y:y + crop_h, x:x + crop_w]
-
     if cropped.size == 0:
         cropped = base
 
     frame = cv2.resize(cropped, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
 
-    # Lightweight cinematic fade at the start and end of each image.
     fade_frames = max(1, int(FPS * 0.16))
     fade_in = min(1.0, (frame_index + 1) / fade_frames)
     fade_out = min(1.0, (frame_count - frame_index) / fade_frames)
@@ -255,11 +274,9 @@ def _make_frame(base, effect, frame_index, frame_count):
 
 
 def render_video(images, output_path, total_seconds, progress_callback=None):
-    """
-    Render with OpenCV VideoWriter. No subprocess and no external ffmpeg command.
-    Note: OpenCV may use codec libraries internally, depending on its build.
-    """
     count = len(images)
+    log.info("render start images=%s target_seconds=%s output=%s",
+             count, total_seconds, output_path)
     if count == 0:
         raise ValueError("No images available to render.")
 
@@ -267,12 +284,15 @@ def render_video(images, output_path, total_seconds, progress_callback=None):
     frames_per_image = max(2, round(duration * FPS))
     actual_duration = (frames_per_image * count) / FPS
 
+    log.info("render plan per_image=%.3fs frames_per_image=%s total_frames=%s "
+             "actual_duration=%.1fs",
+             duration, frames_per_image, frames_per_image * count, actual_duration)
+
     if actual_duration > MAX_VIDEO_DURATION:
         raise ValueError("Video exceeds the 10-minute limit.")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    # mp4v is commonly available in opencv-python-headless Linux wheels.
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_path, fourcc, FPS, (WIDTH, HEIGHT))
 
@@ -292,13 +312,15 @@ def render_video(images, output_path, total_seconds, progress_callback=None):
         for image_index, image_path in enumerate(images):
             base = cv2.imread(image_path, cv2.IMREAD_COLOR)
             if base is None:
-                print(f"Skipping unreadable prepared image: {image_path}")
+                log.warning("render skip unreadable image=%s", image_path)
                 continue
 
             if base.shape[1] != WIDTH or base.shape[0] != HEIGHT:
                 base = cv2.resize(base, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
 
             effect = effects[image_index % len(effects)]
+            log.info("render image [%s/%s] effect=%s path=%s",
+                     image_index + 1, count, effect, image_path)
 
             for frame_index in range(frames_per_image):
                 frame = _make_frame(base, effect, frame_index, frames_per_image)
@@ -306,9 +328,10 @@ def render_video(images, output_path, total_seconds, progress_callback=None):
                 completed_frames += 1
 
                 percent = int((completed_frames / max(1, total_frames)) * 100)
-                # Send progress only at 5% intervals to avoid Telegram API spam.
                 if progress_callback and (percent >= last_reported + 5 or percent == 100):
                     last_reported = percent
+                    log.info("render progress %s%% (frame %s/%s)",
+                             percent, completed_frames, total_frames)
                     progress_callback(percent, image_index + 1, count)
 
             del base
@@ -316,7 +339,11 @@ def render_video(images, output_path, total_seconds, progress_callback=None):
     finally:
         writer.release()
 
-    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+    size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    log.info("render done path=%s size=%s bytes duration=%.1fs",
+             output_path, size, actual_duration)
+
+    if not os.path.exists(output_path) or size < 1024:
         raise RuntimeError("Video rendering failed: output file is empty.")
 
     return actual_duration
@@ -337,7 +364,6 @@ async def finish_video(client, message):
     if session.get("processing"):
         return await message.reply("Your video is already being created.")
 
-    # Take the session lock so no photo can land mid-render.
     lock = session.get("lock")
     if lock is None:
         lock = asyncio.Lock()
@@ -351,6 +377,9 @@ async def finish_video(client, message):
     async with lock:
         session["processing"] = True
 
+    log.info("finish_video start user=%s images=%s zip=%s",
+             user_id, len(session["images"]), bool(session.get("zip_path")))
+
     status = await message.reply("🖼️ Checking uploaded images...")
     output = None
 
@@ -358,9 +387,14 @@ async def finish_video(client, message):
         images = await asyncio.to_thread(prepare_images, session)
         count = len(images)
 
-        requested_duration = session.get("duration")
-        if requested_duration is None:
+        # CHANGE: manual duration is ignored by default -> always automatic.
+        if ALLOW_MANUAL_DURATION and session.get("duration") is not None:
+            requested_duration = float(session["duration"])
+            log.info("using manual duration=%s", requested_duration)
+        else:
             requested_duration = max(5, count * DEFAULT_IMAGE_DURATION)
+            log.info("auto duration computed=%s for %s images",
+                     requested_duration, count)
 
         requested_duration = min(float(requested_duration), MAX_VIDEO_DURATION)
 
@@ -417,14 +451,15 @@ async def finish_video(client, message):
                         )
                         last_percent = percent
                         last_edit_time = now
-                    except Exception:
-                        pass
+                    except Exception as error:
+                        log.warning("status edit failed: %s", error)
             except asyncio.TimeoutError:
                 continue
             except queue.Empty:
                 continue
 
         actual_duration = await render_task
+        log.info("render_task returned duration=%.1fs", actual_duration)
 
         await message.reply_video(
             output,
@@ -439,8 +474,11 @@ async def finish_video(client, message):
         )
 
         await status.edit("✅ Video created successfully!")
+        log.info("finish_video success user=%s images=%s duration=%.1fs",
+                 user_id, count, actual_duration)
 
     except Exception as error:
+        log.exception("finish_video failed user=%s err=%s", user_id, error)
         try:
             await status.edit(f"❌ Video creation failed:\n{str(error)[:1500]}")
         except Exception:
@@ -452,12 +490,14 @@ async def finish_video(client, message):
             work = session.get("work")
             if work and os.path.isdir(work):
                 shutil.rmtree(work, ignore_errors=True)
+                log.info("cleanup work=%s", work)
 
         if output and os.path.exists(output):
             try:
                 os.remove(output)
-            except OSError:
-                pass
+                log.info("cleanup output=%s", output)
+            except OSError as error:
+                log.warning("cleanup output failed: %s", error)
 
 
 # ---------------- PYROGRAM HANDLERS ----------------
@@ -484,6 +524,8 @@ def register_image_video_handlers(bot):
                     "then run /imagevideo again."
                 )
 
+        # Manual duration is accepted as a command arg but ignored unless
+        # ALLOW_MANUAL_DURATION is True.
         duration = None
         if len(message.command) > 1:
             try:
@@ -495,13 +537,15 @@ def register_image_video_handlers(bot):
                     "Usage: /imagevideo 90\n"
                     "Duration must be 5–600 seconds."
                 )
+            if not ALLOW_MANUAL_DURATION:
+                log.info("manual duration ignored (auto mode enabled)")
 
-        # Safe to drop the previous session now.
         old = sessions.pop(user_id, None)
         if old:
             old_work = old.get("work")
             if old_work and os.path.isdir(old_work):
                 shutil.rmtree(old_work, ignore_errors=True)
+                log.info("reset old work=%s", old_work)
 
         os.makedirs(WORK_DIR, exist_ok=True)
         work = tempfile.mkdtemp(prefix=f"{user_id}_", dir=WORK_DIR)
@@ -513,7 +557,13 @@ def register_image_video_handlers(bot):
             "duration": duration,
             "processing": False,
             "lock": asyncio.Lock(),
+            # CHANGE: single status message so "Image added" updates in place
+            # instead of spamming a new reply every time.
+            "status_message": None,
+            "status_text": "",
         }
+
+        log.info("session started user=%s work=%s", user_id, work)
 
         await message.reply(
             "🎬 **Image to Video Creator**\n\n"
@@ -521,13 +571,39 @@ def register_image_video_handlers(bot):
             "📸 Maximum: 300 images\n"
             "🎞️ Output: 720p · 15 FPS\n"
             "✨ Automatic pan, zoom and fade effects\n"
-            "⏱️ Duration: Automatic, or set it with /imagevideo 90\n\n"
+            "⏱️ Duration: Automatic (based on image count)\n\n"
             "Commands:\n"
-            "/imagevideo 90 - Set 90-second duration\n"
             "/ivmusic - Check audio support\n"
             "/finishvideo - Create video\n"
             "/cancelvideo - Cancel session"
         )
+
+    async def _update_image_status(session, bot, chat_id, new_line):
+        """
+        CHANGE: keep ONE status message per session and edit it, so users
+        don't get "✅ Image added" spammed for every upload.
+        """
+        status_message = session.get("status_message")
+        lines = session.get("status_lines") or []
+        lines.append(new_line)
+
+        # Show only the last 10 lines to keep the message tidy.
+        preview = lines[-10:]
+        text = (
+            "📥 **Receiving images**\n\n"
+            + "\n".join(preview)
+            + f"\n\n📸 Total: {len(session['images'])}/{MAX_IMAGES}"
+        )
+        session["status_lines"] = lines
+
+        try:
+            if status_message is None:
+                status_message = await bot.send_message(chat_id, text)
+                session["status_message"] = status_message
+            else:
+                await status_message.edit_text(text)
+        except Exception as error:
+            log.warning("image status update failed: %s", error)
 
     async def receive_photo(_, message):
         if not message.from_user:
@@ -543,7 +619,6 @@ def register_image_video_handlers(bot):
             session["lock"] = lock
 
         async with lock:
-            # Re-check after acquiring the lock: state may have changed.
             if session.get("processing"):
                 return
             if session.get("zip_path"):
@@ -551,10 +626,11 @@ def register_image_video_handlers(bot):
             if len(session["images"]) >= MAX_IMAGES:
                 return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
 
-            # Unique per-message filename avoids temp collisions when
-            # multiple photos arrive close together.
             filename = f"photo_{message.id}.jpg"
             path = os.path.join(session["work"], filename)
+
+            log.info("photo received user=%s msg=%s -> %s",
+                     message.from_user.id, message.id, path)
 
             result = await safe_download(message, path)
             if not result:
@@ -563,8 +639,13 @@ def register_image_video_handlers(bot):
                 )
 
             session["images"].append((filename, result))
-            await message.reply(
-                f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}"
+            total = len(session["images"])
+            log.info("photo stored user=%s total=%s", message.from_user.id, total)
+
+            # CHANGE: edit the single status message instead of new replies.
+            await _update_image_status(
+                session, bot, message.chat.id,
+                f"✅ {filename} → {total}/{MAX_IMAGES}"
             )
 
     async def receive_document(_, message):
@@ -588,6 +669,9 @@ def register_image_video_handlers(bot):
             extension = Path(filename).suffix.lower()
             file_size = message.document.file_size or 0
 
+            log.info("document received user=%s msg=%s name=%s size=%s",
+                     message.from_user.id, message.id, filename, file_size)
+
             if extension in AUDIO_EXTENSIONS:
                 return await message.reply(
                     "🎵 Background music is not available in this lightweight "
@@ -596,9 +680,7 @@ def register_image_video_handlers(bot):
 
             if extension == ".zip":
                 if session["images"] or session.get("zip_path"):
-                    return await message.reply(
-                        "Use one ZIP OR individual images."
-                    )
+                    return await message.reply("Use one ZIP OR individual images.")
                 if file_size > MAX_ZIP_SIZE:
                     return await message.reply("ZIP limit is 100 MB.")
 
@@ -608,8 +690,9 @@ def register_image_video_handlers(bot):
                     return await message.reply(
                         "⚠️ Could not download that ZIP. Please resend it."
                     )
-
                 session["zip_path"] = result
+                log.info("zip stored user=%s path=%s",
+                         message.from_user.id, result)
                 return await message.reply(
                     "📦 ZIP received. Send /finishvideo when ready."
                 )
@@ -619,7 +702,6 @@ def register_image_video_handlers(bot):
 
             if session.get("zip_path"):
                 return await message.reply("You already sent a ZIP file.")
-
             if len(session["images"]) >= MAX_IMAGES:
                 return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
 
@@ -633,8 +715,12 @@ def register_image_video_handlers(bot):
                 )
 
             session["images"].append((filename, result))
-            await message.reply(
-                f"✅ Image added: {len(session['images'])}/{MAX_IMAGES}"
+            total = len(session["images"])
+            log.info("document stored user=%s total=%s", message.from_user.id, total)
+
+            await _update_image_status(
+                session, bot, message.chat.id,
+                f"✅ {filename} → {total}/{MAX_IMAGES}"
             )
 
     async def finish(_, message):
@@ -663,15 +749,14 @@ def register_image_video_handlers(bot):
         work = session.get("work")
         if work and os.path.isdir(work):
             shutil.rmtree(work, ignore_errors=True)
+        log.info("session cancelled user=%s", message.from_user.id)
         await message.reply("🛑 Image-to-video session cancelled.")
 
     async def add_music(_, message):
         if not message.from_user:
             return
-
         if message.from_user.id not in sessions:
             return await message.reply("Start with /imagevideo first.")
-
         await message.reply(
             "🎵 Music muxing is disabled in this lightweight version so the "
             "server does not need an external FFmpeg command. The video will "
