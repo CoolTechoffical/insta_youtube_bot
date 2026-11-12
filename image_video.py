@@ -18,8 +18,6 @@ from pyrogram import filters
 from pyrogram.handlers import MessageHandler
 
 
-# ---------------- LOGGING ----------------
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("image_video")
 
 
-# ---------------- CONFIGURATION ----------------
+# ---------------- CONFIG ----------------
 
 MAX_IMAGES = 300
 MAX_ZIP_SIZE = 100 * 1024 * 1024
@@ -59,10 +57,8 @@ sessions = {}
 # ---------------- HELPERS ----------------
 
 def natural_sort_key(value):
-    return [
-        int(part) if part.isdigit() else part.lower()
-        for part in re.split(r"(\d+)", str(value))
-    ]
+    return [int(p) if p.isdigit() else p.lower()
+            for p in re.split(r"(\d+)", str(value))]
 
 
 def _has_transparency(path):
@@ -82,18 +78,18 @@ def _has_transparency(path):
 def prepare_image(source, destination):
     with Image.open(source) as image:
         if image.width * image.height > MAX_IMAGE_PIXELS:
-            raise ValueError("Image resolution is too large.")
+            raise ValueError("Image resolution too large.")
         image = ImageOps.exif_transpose(image).convert("RGB")
-        target_ratio = WIDTH / HEIGHT
-        current_ratio = image.width / image.height
-        if current_ratio > target_ratio:
-            new_width = max(1, int(image.height * target_ratio))
-            left = (image.width - new_width) // 2
-            image = image.crop((left, 0, left + new_width, image.height))
+        target = WIDTH / HEIGHT
+        current = image.width / image.height
+        if current > target:
+            nw = max(1, int(image.height * target))
+            left = (image.width - nw) // 2
+            image = image.crop((left, 0, left + nw, image.height))
         else:
-            new_height = max(1, int(image.width / target_ratio))
-            top = (image.height - new_height) // 2
-            image = image.crop((0, top, image.width, top + new_height))
+            nh = max(1, int(image.width / target))
+            top = (image.height - nh) // 2
+            image = image.crop((0, top, image.width, top + nh))
         image = image.resize((WIDTH, HEIGHT), Image.Resampling.BILINEAR)
         image.save(destination, "JPEG", quality=88, optimize=False)
 
@@ -107,11 +103,9 @@ def _analyze_image(path):
     except Exception:
         return {"brightness": 0.5, "saturation": 0.3, "warmth": 0.0,
                 "edge": 0.1, "portrait": False}
-
     r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
     brightness = float(arr.mean())
-    max_c = arr.max(axis=-1)
-    min_c = arr.min(axis=-1)
+    max_c, min_c = arr.max(axis=-1), arr.min(axis=-1)
     sat = float(np.where(max_c > 0, (max_c - min_c) / (max_c + 1e-6), 0).mean())
     warmth = float((r - b).mean())
     gray = arr.mean(axis=-1)
@@ -124,14 +118,14 @@ def _analyze_image(path):
 def _choose_mood(stats_list):
     if not stats_list:
         return "cinematic"
-    avg_bright = sum(s["brightness"] for s in stats_list) / len(stats_list)
-    avg_sat = sum(s["saturation"] for s in stats_list) / len(stats_list)
-    avg_warm = sum(s["warmth"] for s in stats_list) / len(stats_list)
-    avg_edge = sum(s["edge"] for s in stats_list) / len(stats_list)
-    portrait_share = sum(1 for s in stats_list if s["portrait"]) / len(stats_list)
+    n = len(stats_list)
+    avg_sat = sum(s["saturation"] for s in stats_list) / n
+    avg_warm = sum(s["warmth"] for s in stats_list) / n
+    avg_edge = sum(s["edge"] for s in stats_list) / n
+    portrait = sum(1 for s in stats_list if s["portrait"]) / n
     if avg_sat < 0.15:
         return "mono"
-    if avg_warm > 0.03 and avg_sat > 0.25 and portrait_share > 0.5:
+    if avg_warm > 0.03 and avg_sat > 0.25 and portrait > 0.5:
         return "romantic"
     if avg_edge > 0.09:
         return "clean"
@@ -141,11 +135,11 @@ def _choose_mood(stats_list):
 def _effect_for(stats, index, forced=None):
     if forced and forced != "auto":
         return forced
-    rotation = ["zoom_in", "zoom_out", "pan_left", "pan_right", "ken_burns"]
+    base = ["zoom_in", "zoom_out", "pan_left", "pan_right", "ken_burns"]
     if stats["portrait"]:
         candidates = ["ken_burns", "pulse", "zoom_in", "zoom_out"]
     else:
-        candidates = rotation
+        candidates = base
     if stats["brightness"] < 0.25:
         candidates = ["zoom_in"] + [c for c in candidates if c != "zoom_in"]
     elif stats["brightness"] > 0.8:
@@ -153,9 +147,9 @@ def _effect_for(stats, index, forced=None):
     return candidates[index % len(candidates)]
 
 
-def _transition_for(index, prev_stats, next_stats):
+def _transition_for(index, prev, nxt):
     base = ["crossfade", "slide", "circle_reveal", "zoom_blur"]
-    if prev_stats and next_stats and prev_stats["edge"] > 0.09 and next_stats["edge"] > 0.09:
+    if prev and nxt and prev["edge"] > 0.09 and nxt["edge"] > 0.09:
         return "crossfade"
     return base[index % len(base)]
 
@@ -192,6 +186,27 @@ async def safe_download(message, path, retries=2):
 
 # ---------------- ZIP ----------------
 
+def count_zip_images(zip_path):
+    """Count valid image entries inside a ZIP without extracting."""
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            count = 0
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                filename = info.filename.replace("\\", "/")
+                parts = Path(filename).parts
+                if filename.startswith("/") or ".." in parts:
+                    continue
+                if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
+                    continue
+                count += 1
+            return count
+    except Exception as error:
+        log.warning("zip count failed %s: %s", zip_path, error)
+        return 0
+
+
 def extract_zip(zip_path, work):
     log.info("zip extract start path=%s", zip_path)
     if os.path.getsize(zip_path) > MAX_ZIP_SIZE:
@@ -210,7 +225,7 @@ def extract_zip(zip_path, work):
             if Path(filename).suffix.lower() not in IMAGE_EXTENSIONS:
                 continue
             members.append(info)
-        members.sort(key=lambda item: natural_sort_key(item.filename))
+        members.sort(key=lambda i: natural_sort_key(i.filename))
         log.info("zip members=%s", len(members))
         if len(members) > MAX_IMAGES:
             raise ValueError(f"Maximum {MAX_IMAGES} images allowed.")
@@ -219,9 +234,9 @@ def extract_zip(zip_path, work):
             if total_size > MAX_EXTRACTED_SIZE:
                 raise ValueError("Extracted images exceed the 500 MB limit.")
             extension = Path(info.filename).suffix.lower()
-            destination = os.path.join(work, f"source_{index:04d}{extension}")
+            dest = os.path.join(work, f"source_{index:04d}{extension}")
             written = 0
-            with archive.open(info) as source, open(destination, "wb") as output:
+            with archive.open(info) as source, open(dest, "wb") as output:
                 while True:
                     chunk = source.read(1024 * 1024)
                     if not chunk:
@@ -230,7 +245,7 @@ def extract_zip(zip_path, work):
                     if written > info.file_size or written > MAX_EXTRACTED_SIZE:
                         raise ValueError("Invalid or oversized ZIP entry.")
                     output.write(chunk)
-            extracted.append((info.filename, destination))
+            extracted.append((info.filename, dest))
             log.info("zip extracted [%s/%s] %s (%s bytes)",
                      index + 1, len(members), info.filename, written)
     if not extracted:
@@ -246,7 +261,7 @@ def prepare_images(session):
     if session.get("zip_path"):
         sources.extend(extract_zip(session["zip_path"], work))
     sources.extend(session["images"])
-    sources.sort(key=lambda item: natural_sort_key(item[0]))
+    sources.sort(key=lambda i: natural_sort_key(i[0]))
     log.info("prepare_images sources=%s", len(sources))
     if not sources:
         raise ValueError("No images uploaded.")
@@ -254,13 +269,13 @@ def prepare_images(session):
         raise ValueError(f"Maximum {MAX_IMAGES} images allowed.")
     prepared, stats_list, skipped = [], [], 0
     for index, (filename, source) in enumerate(sources):
-        destination = os.path.join(work, f"image_{index:04d}.jpg")
+        dest = os.path.join(work, f"image_{index:04d}.jpg")
         try:
-            prepare_image(source, destination)
-            prepared.append(destination)
-            stats_list.append(_analyze_image(destination))
+            prepare_image(source, dest)
+            prepared.append(dest)
+            stats_list.append(_analyze_image(dest))
             log.info("prepared [%s/%s] %s -> %s",
-                     index + 1, len(sources), filename, destination)
+                     index + 1, len(sources), filename, dest)
         except Exception as error:
             skipped += 1
             log.warning("skip invalid image [%s/%s] %s: %s",
@@ -295,23 +310,21 @@ def _apply_mood_tint(frame, mood):
 def _apply_vignette(frame, strength=0.35):
     h, w = frame.shape[:2]
     y, x = np.ogrid[:h, :w]
-    cx, cy = w / 2, h / 2
-    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-    mask = 1.0 - np.clip(r / (0.75 * max(cx, cy)), 0, 1) * strength
+    r = np.sqrt((x - w / 2) ** 2 + (y - h / 2) ** 2)
+    mask = 1.0 - np.clip(r / (0.75 * max(w / 2, h / 2)), 0, 1) * strength
     mask = np.dstack([mask] * 3)
     return (frame.astype(np.float32) * mask).astype(np.uint8)
 
 
-def _apply_particles(frame, mood, frame_index, frame_count, lite):
+def _apply_particles(frame, mood, idx, count, lite):
     if lite or mood not in ("romantic", "cinematic"):
         return frame
     h, w = frame.shape[:2]
     overlay = np.zeros_like(frame)
-    rng = random.Random(1234 + frame_index // 4)
-    count = 25 if mood == "romantic" else 18
-    for _ in range(count):
-        px = rng.randint(0, w - 1)
-        py = rng.randint(0, h - 1)
+    rng = random.Random(1234 + idx // 4)
+    n = 25 if mood == "romantic" else 18
+    for _ in range(n):
+        px, py = rng.randint(0, w - 1), rng.randint(0, h - 1)
         radius = rng.choice([2, 3, 4])
         color = (180, 190, 255) if mood == "romantic" else (200, 220, 255)
         cv2.circle(overlay, (px, py), radius, color, -1)
@@ -319,11 +332,11 @@ def _apply_particles(frame, mood, frame_index, frame_count, lite):
     return cv2.addWeighted(frame, 1.0, overlay, 0.35, 0)
 
 
-def _apply_light_leak(frame, frame_index, frame_count, lite):
+def _apply_light_leak(frame, idx, count, lite):
     if lite:
         return frame
     h, w = frame.shape[:2]
-    progress = frame_index / max(1, frame_count - 1)
+    progress = idx / max(1, count - 1)
     band_x = int((progress * 1.4 - 0.2) * w)
     band_w = int(w * 0.25)
     x0 = max(0, band_x - band_w // 2)
@@ -339,70 +352,63 @@ def _apply_light_leak(frame, frame_index, frame_count, lite):
 
 
 def _crop_zoom(base, zoom, x_off, y_off):
-    crop_w = max(2, int(WIDTH / zoom))
-    crop_h = max(2, int(HEIGHT / zoom))
-    max_x = max(0, WIDTH - crop_w)
-    max_y = max(0, HEIGHT - crop_h)
-    x = max(0, min(int(max_x * x_off), max_x))
-    y = max(0, min(int(max_y * y_off), max_y))
-    return base[y:y + crop_h, x:x + crop_w]
+    cw = max(2, int(WIDTH / zoom))
+    ch = max(2, int(HEIGHT / zoom))
+    mx, my = max(0, WIDTH - cw), max(0, HEIGHT - ch)
+    x = max(0, min(int(mx * x_off), mx))
+    y = max(0, min(int(my * y_off), my))
+    return base[y:y + ch, x:x + cw]
 
 
-def _make_frame(base, effect, frame_index, frame_count, mood, lite,
-                logo=None, logo_phase=None):
-    progress = frame_index / max(1, frame_count - 1)
+def _make_frame(base, effect, fi, fc, mood, lite, logo=None, phase=None):
+    progress = fi / max(1, fc - 1)
     if effect == "zoom_in":
-        zoom, x_off, y_off = 1.0 + 0.07 * progress, 0.5, 0.5
+        zoom, xo, yo = 1.0 + 0.07 * progress, 0.5, 0.5
     elif effect == "zoom_out":
-        zoom, x_off, y_off = 1.07 - 0.07 * progress, 0.5, 0.5
+        zoom, xo, yo = 1.07 - 0.07 * progress, 0.5, 0.5
     elif effect == "ken_burns":
-        zoom = 1.0 + 0.06 * progress
-        x_off = 0.35 + 0.3 * progress
-        y_off = 0.4 + 0.2 * progress
+        zoom, xo, yo = 1.0 + 0.06 * progress, 0.35 + 0.3 * progress, 0.4 + 0.2 * progress
     elif effect == "pulse":
         zoom = 1.0 + 0.04 * math.sin(progress * math.pi * 2)
-        x_off, y_off = 0.5, 0.5
+        xo, yo = 0.5, 0.5
     elif effect == "pan_left":
-        zoom, x_off, y_off = 1.06, 1.0 - progress, 0.5
+        zoom, xo, yo = 1.06, 1.0 - progress, 0.5
     elif effect == "pan_right":
-        zoom, x_off, y_off = 1.06, progress, 0.5
+        zoom, xo, yo = 1.06, progress, 0.5
     elif effect == "pan_up":
-        zoom, x_off, y_off = 1.06, 0.5, progress
+        zoom, xo, yo = 1.06, 0.5, progress
     elif effect == "pan_down":
-        zoom, x_off, y_off = 1.06, 0.5, 1.0 - progress
+        zoom, xo, yo = 1.06, 0.5, 1.0 - progress
     else:
-        zoom, x_off, y_off = 1.0, 0.5, 0.5
+        zoom, xo, yo = 1.0, 0.5, 0.5
     zoom = max(1.0, zoom)
-    cropped = _crop_zoom(base, zoom, x_off, y_off)
+    cropped = _crop_zoom(base, zoom, xo, yo)
     if cropped.size == 0:
         cropped = base
     frame = cv2.resize(cropped, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
 
-    fade_frames = max(1, int(FPS * 0.16))
-    alpha = min(1.0, (frame_index + 1) / fade_frames,
-                1.0, (frame_count - frame_index) / fade_frames)
+    fade_n = max(1, int(FPS * 0.16))
+    alpha = min(1.0, (fi + 1) / fade_n, 1.0, (fc - fi) / fade_n)
     if alpha < 1.0:
         frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=0)
 
     frame = _apply_mood_tint(frame, mood)
     frame = _apply_vignette(frame, 0.35 if mood != "clean" else 0.15)
-    frame = _apply_particles(frame, mood, frame_index, frame_count, lite)
-    frame = _apply_light_leak(frame, frame_index, frame_count, lite)
+    frame = _apply_particles(frame, mood, fi, fc, lite)
+    frame = _apply_light_leak(frame, fi, fc, lite)
 
-    if logo is not None and logo_phase == "intro":
-        frame = _blend_logo(frame, logo, frame_index, frame_count, mode="intro")
-    elif logo is not None and logo_phase == "corner":
-        frame = _blend_logo(frame, logo, frame_index, frame_count, mode="corner")
+    if logo is not None and phase == "intro":
+        frame = _blend_logo(frame, logo, fi, fc, "intro")
+    elif logo is not None and phase == "corner":
+        frame = _blend_logo(frame, logo, fi, fc, "corner")
     return frame
 
 
-def _blend_logo(frame, logo, frame_index, frame_count, mode):
-    if logo is None:
-        return frame
+def _blend_logo(frame, logo, fi, fc, mode):
     lh, lw = logo.shape[:2]
     fh, fw = frame.shape[:2]
     if mode == "intro":
-        progress = frame_index / max(1, frame_count - 1)
+        progress = fi / max(1, fc - 1)
         if progress < 0.15:
             alpha = progress / 0.15
         elif progress < 0.75:
@@ -411,27 +417,23 @@ def _blend_logo(frame, logo, frame_index, frame_count, mode):
             alpha = max(0.0, 1.0 - (progress - 0.75) / 0.25)
         scale = 0.35
     else:
-        alpha = 0.55
-        scale = 0.14
-    target_w = int(fw * scale)
-    target_h = max(1, int(lh * (target_w / lw)))
-    lw2, lh2 = target_w, target_h
-    if lw2 <= 0 or lh2 <= 0 or lw2 >= fw or lh2 >= fh:
+        alpha, scale = 0.55, 0.14
+    tw = int(fw * scale)
+    th = max(1, int(lh * (tw / lw)))
+    if tw <= 0 or th <= 0 or tw >= fw or th >= fh:
         return frame
-    resized = cv2.resize(logo, (lw2, lh2), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(logo, (tw, th), interpolation=cv2.INTER_AREA)
     if mode == "intro":
-        x, y = (fw - lw2) // 2, (fh - lh2) // 2
+        x, y = (fw - tw) // 2, (fh - th) // 2
     else:
-        margin = int(fw * 0.02)
-        x, y = fw - lw2 - margin, fh - lh2 - margin
-    roi = frame[y:y + lh2, x:x + lw2]
+        m = int(fw * 0.02)
+        x, y = fw - tw - m, fh - th - m
+    roi = frame[y:y + th, x:x + tw]
     if roi.shape[:2] != resized.shape[:2]:
         return frame
     bgr = resized[..., :3].astype(np.float32)
     a = (resized[..., 3:4].astype(np.float32) / 255.0) * alpha
-    frame[y:y + lh2, x:x + lw2] = (
-        bgr * a + roi.astype(np.float32) * (1 - a)
-    ).astype(np.uint8)
+    frame[y:y + th, x:x + tw] = (bgr * a + roi.astype(np.float32) * (1 - a)).astype(np.uint8)
     return frame
 
 
@@ -454,15 +456,13 @@ def _circle_reveal(a, b, t):
     mask = np.zeros((h, w), dtype=np.uint8)
     radius = int(math.sqrt((w / 2) ** 2 + (h / 2) ** 2) * t)
     cv2.circle(mask, (w // 2, h // 2), max(1, radius), 255, -1)
-    mask3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
-    return (b.astype(np.float32) * mask3
-            + a.astype(np.float32) * (1 - mask3)).astype(np.uint8)
+    m3 = cv2.merge([mask, mask, mask]).astype(np.float32) / 255.0
+    return (b.astype(np.float32) * m3 + a.astype(np.float32) * (1 - m3)).astype(np.uint8)
 
 
 def _zoom_blur_transition(a, b, t):
     strength = 1.0 + 0.2 * math.sin(t * math.pi)
-    zoomed = cv2.resize(b, None, fx=strength, fy=strength,
-                        interpolation=cv2.INTER_LINEAR)
+    zoomed = cv2.resize(b, None, fx=strength, fy=strength, interpolation=cv2.INTER_LINEAR)
     y0 = (zoomed.shape[0] - HEIGHT) // 2
     x0 = (zoomed.shape[1] - WIDTH) // 2
     zoomed = zoomed[y0:y0 + HEIGHT, x0:x0 + WIDTH]
@@ -491,12 +491,11 @@ def render_video(images, stats_list, output_path, total_seconds,
              count, total_seconds, mood, lite, forced_effect, bool(logo_path))
     if count == 0:
         raise ValueError("No images available to render.")
-    per_image = max(MIN_IMAGE_DURATION, float(total_seconds) / count)
-    frames_per_image = max(2, round(per_image * FPS))
-    actual_duration = (frames_per_image * count) / FPS
-    log.info("render plan per=%.2fs frames=%s actual=%.1fs",
-             per_image, frames_per_image, actual_duration)
-    if actual_duration > MAX_VIDEO_DURATION:
+    per = max(MIN_IMAGE_DURATION, float(total_seconds) / count)
+    fpi = max(2, round(per * FPS))
+    actual = (fpi * count) / FPS
+    log.info("render plan per=%.2fs fpi=%s actual=%.1fs", per, fpi, actual)
+    if actual > MAX_VIDEO_DURATION:
         raise ValueError("Video exceeds the 10-minute limit.")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -511,25 +510,25 @@ def render_video(images, stats_list, output_path, total_seconds,
     if logo_path and os.path.exists(logo_path):
         logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
         if logo is not None and (logo.ndim < 3 or logo.shape[2] != 4):
-            log.warning("logo missing alpha; ignoring logo")
+            log.warning("logo missing alpha; ignoring")
             logo = None
+        elif logo is not None:
+            log.info("logo loaded shape=%s", logo.shape)
 
-    transition_frames = max(2, int(FPS * 0.25))
-    total_frames = frames_per_image * count
+    trans_frames = max(2, int(FPS * 0.25))
+    total_frames = fpi * count
     completed = 0
     last_pct = -1
 
     try:
-        prev_last_frame = None
-        prev_stats = None
-        for i, image_path in enumerate(images):
-            base = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        prev_last, prev_stats = None, None
+        for i, path in enumerate(images):
+            base = cv2.imread(path, cv2.IMREAD_COLOR)
             if base is None:
-                log.warning("render skip unreadable %s", image_path)
+                log.warning("render skip unreadable %s", path)
                 continue
             if base.shape[1] != WIDTH or base.shape[0] != HEIGHT:
-                base = cv2.resize(base, (WIDTH, HEIGHT),
-                                  interpolation=cv2.INTER_AREA)
+                base = cv2.resize(base, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
             stats = stats_list[i] if i < len(stats_list) else {
                 "brightness": 0.5, "saturation": 0.3, "warmth": 0.0,
                 "edge": 0.1, "portrait": False}
@@ -538,76 +537,58 @@ def render_video(images, stats_list, output_path, total_seconds,
             log.info("render image [%s/%s] effect=%s transition=%s",
                      i + 1, count, effect, transition)
 
-            frames_buffer = []
-            for fi in range(frames_per_image):
-                if logo is not None and i == 0:
-                    logo_phase = "intro"
-                elif logo is not None:
-                    logo_phase = "corner"
+            buf = []
+            for fi in range(fpi):
+                if logo is not None:
+                    phase = "intro" if i == 0 else "corner"
                 else:
-                    logo_phase = None
-                frames_buffer.append(_make_frame(
-                    base, effect, fi, frames_per_image, mood, lite,
-                    logo, logo_phase))
+                    phase = None
+                buf.append(_make_frame(base, effect, fi, fpi, mood, lite, logo, phase))
 
-            if prev_last_frame is not None and len(frames_buffer) >= transition_frames:
-                for ti in range(transition_frames):
-                    t = (ti + 1) / (transition_frames + 1)
-                    blended = _apply_transition(
-                        prev_last_frame, frames_buffer[ti], transition, t)
-                    writer.write(blended)
+            if prev_last is not None and len(buf) >= trans_frames:
+                for ti in range(trans_frames):
+                    t = (ti + 1) / (trans_frames + 1)
+                    writer.write(_apply_transition(prev_last, buf[ti], transition, t))
                     completed += 1
-                start_idx = transition_frames
+                start = trans_frames
             else:
-                start_idx = 0
-            for frame in frames_buffer[start_idx:]:
+                start = 0
+            for frame in buf[start:]:
                 writer.write(frame)
                 completed += 1
-            prev_last_frame = frames_buffer[-1] if frames_buffer else None
+            prev_last = buf[-1] if buf else None
             prev_stats = stats
 
             if progress_callback:
                 pct = int((completed / max(1, total_frames)) * 100)
                 if pct >= last_pct + 5 or pct == 100:
                     last_pct = pct
-                    log.info("render progress %s%% (%s/%s)",
-                             pct, completed, total_frames)
+                    log.info("render progress %s%% (%s/%s)", pct, completed, total_frames)
                     progress_callback(pct, i + 1, count)
             del base
     finally:
         writer.release()
 
     size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-    log.info("render done path=%s size=%s duration=%.1fs",
-             output_path, size, actual_duration)
+    log.info("render done path=%s size=%s duration=%.1fs", output_path, size, actual)
     if size < 1024:
         raise RuntimeError("Video rendering failed: output file is empty.")
-    return actual_duration
+    return actual
 
 
-# ---------------- SESSION HELPERS ----------------
+# ---------------- SESSION ----------------
 
 def _new_session(user_id, chat_id):
     os.makedirs(WORK_DIR, exist_ok=True)
     work = tempfile.mkdtemp(prefix=f"{user_id}_", dir=WORK_DIR)
     return {
-        "work": work,
-        "images": [],
-        "zip_path": None,
-        "logo_path": None,
-        "processing": False,
-        "lock": asyncio.Lock(),
-        "last_activity": time.monotonic(),
-        "chat_id": chat_id,
-        "state": "uploading",  # uploading -> q_duration -> q_mood -> q_effect -> rendering
-        "chosen_duration": None,
-        "chosen_mood": None,
-        "chosen_effect": None,
-        "ask_started": 0.0,
-        "question_msg": None,
-        "invalid_count": 0,
-        "watcher": None,
-        "flow": None,
+        "work": work, "images": [], "zip_path": None, "logo_path": None,
+        "processing": False, "lock": asyncio.Lock(),
+        "last_activity": time.monotonic(), "chat_id": chat_id,
+        "state": "uploading", "chosen_duration": None,
+        "chosen_mood": None, "chosen_effect": None,
+        "ask_started": 0.0, "question_msg": None, "invalid_count": 0,
+        "watcher": None, "flow": None, "zip_image_count": None,
     }
 
 
@@ -636,18 +617,31 @@ def _default_duration(count):
     return DEFAULT_IMAGE_DURATION
 
 
+def _effective_image_count(session):
+    """Count of images to be rendered: ZIP entries + direct uploads."""
+    total = len(session["images"])
+    if session.get("zip_path"):
+        if session.get("zip_image_count") is None:
+            session["zip_image_count"] = count_zip_images(session["zip_path"])
+        total += session["zip_image_count"]
+    return total
+
+
 # ---------------- AUTO FINISH / QUESTION FLOW ----------------
 
 async def _auto_finish_watcher(bot, user_id):
-    """Wait for silence, then start the interactive question flow."""
+    log.info("watcher started user=%s", user_id)
     try:
         while True:
             session = sessions.get(user_id)
             if not session:
+                log.info("watcher exit user=%s (no session)", user_id)
                 return
             if session["state"] != "uploading":
+                log.info("watcher exit user=%s (state=%s)", user_id, session["state"])
                 return
             if session.get("processing"):
+                log.info("watcher exit user=%s (processing)", user_id)
                 return
             lock = session.get("lock")
             if lock and lock.locked():
@@ -655,13 +649,16 @@ async def _auto_finish_watcher(bot, user_id):
                 await asyncio.sleep(1.0)
                 continue
             idle = time.monotonic() - session["last_activity"]
-            if idle >= AUTO_FINISH_SILENCE and (session["images"] or session.get("zip_path")):
-                log.info("auto-finish trigger user=%s idle=%.1fs images=%s",
-                         user_id, idle, len(session["images"]))
+            has_any = bool(session["images"]) or bool(session.get("zip_path"))
+            if idle >= AUTO_FINISH_SILENCE and has_any:
+                log.info("auto-finish trigger user=%s idle=%.1fs images=%s zip=%s",
+                         user_id, idle, len(session["images"]),
+                         bool(session.get("zip_path")))
                 await _start_question_flow(bot, user_id)
                 return
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
+        log.info("watcher cancelled user=%s", user_id)
         return
     except Exception as error:
         log.exception("watcher error user=%s: %s", user_id, error)
@@ -669,20 +666,41 @@ async def _auto_finish_watcher(bot, user_id):
 
 async def _start_question_flow(bot, user_id):
     session = sessions.get(user_id)
-    if not session or session["state"] != "uploading":
+    if not session:
+        log.warning("_start_question_flow: no session user=%s", user_id)
+        return
+    if session["state"] != "uploading":
+        log.warning("_start_question_flow: bad state user=%s state=%s",
+                    user_id, session["state"])
         return
     if not (session["images"] or session.get("zip_path")):
+        log.warning("_start_question_flow: nothing to render user=%s", user_id)
         return
 
-    # Basic count (ZIP contents resolved later; use uploaded count for prompt).
-    count = len(session["images"]) if session["images"] else 1
+    count = _effective_image_count(session)
+    log.info("_start_question_flow user=%s count=%s images=%s zip_count=%s",
+             user_id, count, len(session["images"]), session.get("zip_image_count"))
+
+    if count == 0:
+        log.error("_start_question_flow: effective count is 0 user=%s", user_id)
+        try:
+            await bot.send_message(
+                session["chat_id"],
+                "⚠️ The ZIP file contains no supported images. "
+                "Please upload JPG/PNG/WEBP/BMP and try again."
+            )
+        except Exception:
+            pass
+        sessions.pop(user_id, None)
+        return
+
     session["state"] = "q_duration"
     session["ask_started"] = time.monotonic()
     session["invalid_count"] = 0
 
     default_dur = _default_duration(count)
     prompt = (
-        f"✅ {count} image(s) saved.\n\n"
+        f"✅ {count} image(s) detected.\n\n"
         "❓ **Q1 / 3 — Image duration**\n\n"
         "How long should each image show?\n"
         "Reply a number in seconds (e.g. `1.5`),\n"
@@ -692,41 +710,52 @@ async def _start_question_flow(bot, user_id):
     )
     try:
         session["question_msg"] = await bot.send_message(session["chat_id"], prompt)
+        log.info("Q1 sent user=%s msg_id=%s",
+                 user_id, getattr(session["question_msg"], "id", "?"))
     except Exception as error:
-        log.warning("send q1 failed: %s", error)
+        log.exception("send Q1 failed user=%s: %s", user_id, error)
+        sessions.pop(user_id, None)
+        return
 
     session["flow"] = asyncio.create_task(_question_timeout(bot, user_id))
 
 
 async def _question_timeout(bot, user_id):
-    """Auto-skip to the next question when the user doesn't answer."""
+    log.info("question timer started user=%s", user_id)
     try:
         while True:
             session = sessions.get(user_id)
             if not session or session["state"] in ("rendering", "uploading", "done"):
+                log.info("question timer exit user=%s", user_id)
                 return
             idle = time.monotonic() - session["ask_started"]
             if idle >= QUESTION_TIMEOUT:
-                log.info("question timeout user=%s state=%s",
-                         user_id, session["state"])
+                log.info("question timeout user=%s state=%s idle=%.1fs",
+                         user_id, session["state"], idle)
                 await _advance_question(bot, user_id, use_default=True)
                 return
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
+        log.info("question timer cancelled user=%s", user_id)
         return
+    except Exception as error:
+        log.exception("question timer error user=%s: %s", user_id, error)
 
 
 async def _advance_question(bot, user_id, use_default=False):
     session = sessions.get(user_id)
     if not session:
+        log.warning("_advance_question: no session user=%s", user_id)
         return
     state = session["state"]
+    log.info("_advance_question user=%s from=%s use_default=%s",
+             user_id, state, use_default)
 
     if state == "q_duration":
         if use_default or session["chosen_duration"] is None:
-            count = len(session["images"]) if session["images"] else 1
-            session["chosen_duration"] = _default_duration(count)
-            log.info("duration default used user=%s val=%.2f",
+            count = _effective_image_count(session)
+            session["chosen_duration"] = _default_duration(max(1, count))
+            log.info("duration default user=%s val=%.2f",
                      user_id, session["chosen_duration"])
         session["state"] = "q_mood"
         session["ask_started"] = time.monotonic()
@@ -737,10 +766,12 @@ async def _advance_question(bot, user_id, use_default=False):
                 "❓ **Q2 / 3 — Mood**\n\n"
                 "Reply one of:\n"
                 "`romantic` · `cinematic` · `mono` · `clean` · `auto`\n\n"
-                f"⏱️ Auto-skip in {int(QUESTION_TIMEOUT)}s → auto-detect",
+                f"⏱️ Auto-skip in {int(QUESTION_TIMEOUT)}s → auto",
             )
+            log.info("Q2 sent user=%s msg_id=%s",
+                     user_id, getattr(session["question_msg"], "id", "?"))
         except Exception as error:
-            log.warning("send q2 failed: %s", error)
+            log.exception("send Q2 failed user=%s: %s", user_id, error)
         session["flow"] = asyncio.create_task(_question_timeout(bot, user_id))
         return
 
@@ -760,8 +791,10 @@ async def _advance_question(bot, user_id, use_default=False):
                 "`pan_left` · `pan_right` · `auto`\n\n"
                 f"⏱️ Auto-skip in {int(QUESTION_TIMEOUT)}s → auto",
             )
+            log.info("Q3 sent user=%s msg_id=%s",
+                     user_id, getattr(session["question_msg"], "id", "?"))
         except Exception as error:
-            log.warning("send q3 failed: %s", error)
+            log.exception("send Q3 failed user=%s: %s", user_id, error)
         session["flow"] = asyncio.create_task(_question_timeout(bot, user_id))
         return
 
@@ -775,45 +808,50 @@ async def _advance_question(bot, user_id, use_default=False):
 # ---------------- RENDER FLOW ----------------
 
 async def _start_render(bot, user_id):
+    log.info("_start_render enter user=%s", user_id)
     session = sessions.get(user_id)
-    if not session or session.get("processing"):
+    if not session:
+        log.warning("_start_render: no session user=%s", user_id)
+        return
+    if session.get("processing"):
+        log.warning("_start_render: already processing user=%s", user_id)
         return
     if not (session["images"] or session.get("zip_path")):
+        log.warning("_start_render: no images user=%s", user_id)
         return
     session["state"] = "rendering"
-    lock = session["lock"]
-    async with lock:
+    async with session["lock"]:
         session["processing"] = True
 
     chat_id = session["chat_id"]
     status = None
     output = None
     try:
+        log.info("_start_render prep user=%s", user_id)
         status = await bot.send_message(chat_id, "🖼️ Preparing images...")
         images, stats_list = await asyncio.to_thread(prepare_images, session)
         count = len(images)
+        log.info("_start_render prepared user=%s count=%s", user_id, count)
 
-        chosen_duration = float(session["chosen_duration"] or _default_duration(count))
-        total_requested = chosen_duration * count
+        dur = float(session["chosen_duration"] or _default_duration(count))
+        total = dur * count
         capped = False
-        if total_requested > MAX_VIDEO_DURATION:
-            chosen_duration = max(MIN_IMAGE_DURATION, MAX_VIDEO_DURATION / count)
-            total_requested = chosen_duration * count
+        if total > MAX_VIDEO_DURATION:
+            dur = max(MIN_IMAGE_DURATION, MAX_VIDEO_DURATION / count)
+            total = dur * count
             capped = True
-            log.info("duration capped user=%s new=%.2fs", user_id, chosen_duration)
+            log.info("duration capped user=%s new=%.2fs", user_id, dur)
 
         mood = session["chosen_mood"]
         if not mood or mood == "auto":
             mood = _choose_mood(stats_list)
         effect = session["chosen_effect"] or "auto"
-
         lite = count >= LITE_THRESHOLD
 
         summary = (
             "✅ **Settings locked**\n\n"
             f"📸 Images: {count}\n"
-            f"⏱️ Image duration: {chosen_duration:.2f}s "
-            f"(total ~{int(total_requested)}s)\n"
+            f"⏱️ Image duration: {dur:.2f}s (total ~{int(total)}s)\n"
             f"🎨 Mood: {mood}\n"
             f"✨ Effect: {effect}\n"
             f"⚡ Lite mode: {'on' if lite else 'off'}"
@@ -830,22 +868,22 @@ async def _start_render(bot, user_id):
         output = os.path.join(OUTPUT_DIR, f"image_video_{user_id}.mp4")
 
         loop = asyncio.get_running_loop()
-        progress_q = queue.Queue()
+        pq = queue.Queue()
 
-        def report(pct, cur, total):
-            loop.call_soon_threadsafe(progress_q.put_nowait, (pct, cur, total))
+        def report(pct, cur, tot):
+            loop.call_soon_threadsafe(pq.put_nowait, (pct, cur, tot))
 
-        render_task = asyncio.create_task(asyncio.to_thread(
-            render_video, images, stats_list, output, total_requested,
+        rt = asyncio.create_task(asyncio.to_thread(
+            render_video, images, stats_list, output, total,
             mood, lite, session.get("logo_path"),
             None if effect == "auto" else effect, report))
 
         last_edit = 0
         last_pct = -1
-        while not render_task.done():
+        while not rt.done():
             try:
-                pct, cur, total = await asyncio.wait_for(
-                    asyncio.to_thread(progress_q.get, True, 2.0), timeout=2.5)
+                pct, cur, tot = await asyncio.wait_for(
+                    asyncio.to_thread(pq.get, True, 2.0), timeout=2.5)
                 now = time.monotonic()
                 if pct != last_pct and (now - last_edit >= 1.5 or pct == 100):
                     bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
@@ -853,7 +891,7 @@ async def _start_render(bot, user_id):
                         await status.edit_text(
                             "🎬 Rendering...\n\n"
                             f"[{bar}] {pct}%\n"
-                            f"📸 Image: {cur}/{total}\n"
+                            f"📸 Image: {cur}/{tot}\n"
                             f"🎨 Mood: {mood} · ✨ {effect}")
                         last_pct, last_edit = pct, now
                     except Exception:
@@ -863,7 +901,9 @@ async def _start_render(bot, user_id):
             except queue.Empty:
                 continue
 
-        duration = await render_task
+        duration = await rt
+        log.info("_start_render video ready user=%s duration=%.1fs",
+                 user_id, duration)
 
         await bot.send_video(
             chat_id, output,
@@ -880,34 +920,36 @@ async def _start_render(bot, user_id):
             await status.edit_text("✅ Video created successfully!")
         except Exception:
             pass
-        log.info("render success user=%s images=%s duration=%.1fs",
-                 user_id, count, duration)
+        log.info("_start_render success user=%s", user_id)
 
     except Exception as error:
-        log.exception("render failed user=%s: %s", user_id, error)
+        log.exception("_start_render failed user=%s: %s", user_id, error)
         try:
             if status:
                 await status.edit_text(f"❌ Render failed: {str(error)[:800]}")
         except Exception:
             pass
     finally:
+        log.info("_start_render finally user=%s", user_id)
         session = sessions.pop(user_id, None)
         if session:
-            for task_key in ("watcher", "flow"):
-                t = session.get(task_key)
+            for key in ("watcher", "flow"):
+                t = session.get(key)
                 if t and not t.done():
                     t.cancel()
             work = session.get("work")
             if work and os.path.isdir(work):
                 shutil.rmtree(work, ignore_errors=True)
+                log.info("cleanup work=%s", work)
         if output and os.path.exists(output):
             try:
                 os.remove(output)
-            except OSError:
-                pass
+                log.info("cleanup output=%s", output)
+            except OSError as error:
+                log.warning("cleanup output failed: %s", error)
 
 
-# ---------------- MESSAGE HANDLERS ----------------
+# ---------------- HANDLERS ----------------
 
 def register_image_video_handlers(bot):
 
@@ -915,12 +957,10 @@ def register_image_video_handlers(bot):
         if not message.from_user:
             return
         session = await _ensure_session(bot, message)
-        if session["state"] != "uploading":
-            # Extra images during Q&A: keep answers, add to list.
-            if session["state"] in ("q_duration", "q_mood", "q_effect"):
-                pass
-            else:
-                return
+        if session["state"] not in ("uploading", "q_duration", "q_mood", "q_effect"):
+            return
+        if session.get("processing"):
+            return
         _bump(session)
         async with session["lock"]:
             if len(session["images"]) >= MAX_IMAGES:
@@ -932,10 +972,11 @@ def register_image_video_handlers(bot):
                 return await message.reply("⚠️ Could not download, please resend.")
             session["images"].append((filename, result))
             _bump(session)
-            log.info("photo stored user=%s total=%s",
-                     message.from_user.id, len(session["images"]))
+            count = _effective_image_count(session)
+            log.info("photo stored user=%s direct=%s effective=%s",
+                     message.from_user.id, len(session["images"]), count)
             await message.reply(
-                f"📥 {len(session['images'])} image(s) received "
+                f"📥 {count} image(s) received "
                 f"(questions start after {int(AUTO_FINISH_SILENCE)}s silence)")
 
     async def on_document(_, message):
@@ -943,6 +984,8 @@ def register_image_video_handlers(bot):
             return
         session = await _ensure_session(bot, message)
         if session["state"] not in ("uploading", "q_duration", "q_mood", "q_effect"):
+            return
+        if session.get("processing"):
             return
         _bump(session)
         filename = message.document.file_name or "upload"
@@ -962,10 +1005,16 @@ def register_image_video_handlers(bot):
                 if not result:
                     return await message.reply("⚠️ ZIP download failed.")
                 session["zip_path"] = result
+                session["zip_image_count"] = count_zip_images(result)
                 _bump(session)
+                log.info("zip stored user=%s path=%s images=%s",
+                         message.from_user.id, result, session["zip_image_count"])
+                if session["zip_image_count"] == 0:
+                    return await message.reply(
+                        "⚠️ ZIP contains no supported images.")
                 return await message.reply(
-                    f"📦 ZIP received (questions start after "
-                    f"{int(AUTO_FINISH_SILENCE)}s silence)")
+                    f"📦 ZIP received ({session['zip_image_count']} images). "
+                    f"Questions start after {int(AUTO_FINISH_SILENCE)}s silence.")
             if extension not in IMAGE_EXTENSIONS:
                 return
             path = os.path.join(session["work"], f"document_{message.id}{extension}")
@@ -975,13 +1024,17 @@ def register_image_video_handlers(bot):
             if session.get("logo_path") is None and _has_transparency(result):
                 session["logo_path"] = result
                 _bump(session)
+                log.info("logo saved user=%s", message.from_user.id)
                 return await message.reply("🖼️ Logo detected and saved.")
             if len(session["images"]) >= MAX_IMAGES:
                 return await message.reply(f"Maximum {MAX_IMAGES} images reached.")
             session["images"].append((filename, result))
             _bump(session)
+            count = _effective_image_count(session)
+            log.info("document stored user=%s direct=%s effective=%s",
+                     message.from_user.id, len(session["images"]), count)
             await message.reply(
-                f"📥 {len(session['images'])} image(s) received "
+                f"📥 {count} image(s) received "
                 f"(questions start after {int(AUTO_FINISH_SILENCE)}s silence)")
 
     async def on_text(_, message):
@@ -989,17 +1042,24 @@ def register_image_video_handlers(bot):
             return
         user_id = message.from_user.id
         session = sessions.get(user_id)
-        if not session or session.get("processing"):
+        text = message.text.strip().lower()
+
+        if not session:
+            log.info("text ignored user=%s (no session) text=%r", user_id, text[:30])
             return
 
-        text = message.text.strip().lower()
+        log.info("text received user=%s state=%s processing=%s text=%r",
+                 user_id, session["state"], session.get("processing"), text[:40])
+
+        if session.get("processing"):
+            return
+
         _bump(session)
         state = session["state"]
 
-        # Global cancel
         if text in {"cancel", "stop", "x", "abort"}:
-            for task_key in ("watcher", "flow"):
-                t = session.get(task_key)
+            for key in ("watcher", "flow"):
+                t = session.get(key)
                 if t and not t.done():
                     t.cancel()
             sessions.pop(user_id, None)
@@ -1011,47 +1071,47 @@ def register_image_video_handlers(bot):
 
         if state == "uploading":
             if text in {"finish", "done", "go", "render"}:
-                return await _start_question_flow(bot, user_id)
-            return  # ignore other text while uploading
+                log.info("manual finish trigger user=%s", user_id)
+                await _start_question_flow(bot, user_id)
+            return
 
         if state == "q_duration":
             if text == "auto":
                 session["chosen_duration"] = None
-                await _answer_received(message, "⏱️ Duration: auto")
+                await message.reply("⏱️ Duration: auto")
                 return await _advance_question(bot, user_id, use_default=True)
             try:
                 value = float(text)
                 if value < MIN_IMAGE_DURATION or value > 30:
                     raise ValueError
                 session["chosen_duration"] = value
-                await _answer_received(
-                    message, f"⏱️ Duration: {value:.2f}s per image")
+                log.info("duration chosen user=%s val=%.2f", user_id, value)
+                await message.reply(f"⏱️ Duration: {value:.2f}s per image")
                 return await _advance_question(bot, user_id)
             except ValueError:
                 session["invalid_count"] += 1
                 if session["invalid_count"] >= 2:
                     session["chosen_duration"] = None
-                    await message.reply(
-                        "⚠️ Invalid twice → using auto duration.")
+                    await message.reply("⚠️ Invalid twice → using auto.")
                     return await _advance_question(bot, user_id, use_default=True)
                 return await message.reply(
                     f"⚠️ Invalid. Reply a number "
-                    f"({MIN_IMAGE_DURATION}–30 seconds) or `auto`.")
+                    f"({MIN_IMAGE_DURATION}–30s) or `auto`.")
 
         if state == "q_mood":
             moods = {"romantic", "cinematic", "mono", "bw", "clean", "auto"}
             if text in moods:
                 session["chosen_mood"] = "mono" if text == "bw" else text
-                await _answer_received(
-                    message, f"🎨 Mood: {session['chosen_mood']}")
+                log.info("mood chosen user=%s val=%s", user_id, session["chosen_mood"])
+                await message.reply(f"🎨 Mood: {session['chosen_mood']}")
                 return await _advance_question(bot, user_id)
             session["invalid_count"] += 1
             if session["invalid_count"] >= 2:
                 session["chosen_mood"] = "auto"
-                await message.reply("⚠️ Invalid twice → using auto mood.")
+                await message.reply("⚠️ Invalid twice → using auto.")
                 return await _advance_question(bot, user_id)
             return await message.reply(
-                "⚠️ Invalid. Reply one of:\n"
+                "⚠️ Invalid. Reply:\n"
                 "`romantic` · `cinematic` · `mono` · `clean` · `auto`")
 
         if state == "q_effect":
@@ -1059,23 +1119,21 @@ def register_image_video_handlers(bot):
                        "pan_left", "pan_right", "auto"}
             if text in effects:
                 session["chosen_effect"] = text
-                await _answer_received(message, f"✨ Effect: {text}")
+                log.info("effect chosen user=%s val=%s", user_id, text)
+                await message.reply(f"✨ Effect: {text}")
                 return await _advance_question(bot, user_id)
             session["invalid_count"] += 1
             if session["invalid_count"] >= 2:
                 session["chosen_effect"] = "auto"
-                await message.reply("⚠️ Invalid twice → using auto effect.")
+                await message.reply("⚠️ Invalid twice → using auto.")
                 return await _advance_question(bot, user_id)
             return await message.reply(
-                "⚠️ Invalid. Reply one of:\n"
+                "⚠️ Invalid. Reply:\n"
                 "`zoom_in` · `zoom_out` · `ken_burns` · `pulse` · "
                 "`pan_left` · `pan_right` · `auto`")
 
-    async def _answer_received(message, text):
-        try:
-            await message.reply(text)
-        except Exception:
-            pass
+        log.info("text unhandled user=%s state=%s text=%r",
+                 user_id, state, text[:40])
 
     os.makedirs(WORK_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
