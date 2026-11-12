@@ -1,10 +1,13 @@
-
 import os
 import cv2
 import zipfile
 import shutil
 import numpy as np
 import asyncio
+import signal
+import threading
+import logging
+import time
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -20,6 +23,31 @@ from upscale import (
 from image_video import register_image_video_handlers
 
 
+log = logging.getLogger("bot")
+
+# ---------------- SHUTDOWN FLAG ----------------
+
+# Written by app.py's SIGTERM handler so long renders can bail out cleanly.
+SHUTDOWN_FLAG = os.environ.get("SHUTDOWN_FLAG", "/tmp/shutdown.flag")
+_shutdown_event = threading.Event()
+
+
+def is_shutting_down():
+    return _shutdown_event.is_set() or os.path.exists(SHUTDOWN_FLAG)
+
+
+def request_shutdown():
+    log.warning("shutdown requested")
+    _shutdown_event.set()
+    try:
+        with open(SHUTDOWN_FLAG, "w") as f:
+            f.write("1")
+    except Exception as error:
+        log.warning("could not write shutdown flag: %s", error)
+
+
+# ---------------- STATE ----------------
+
 upscale_waiting = set()
 upscale_cancelled = set()
 upscale_caption_waiting = set()
@@ -32,7 +60,6 @@ OUTPUT_DIR = "output"
 
 MAX_LIMIT = 200
 
-# Cancel tracking
 cancel_users = {}
 
 for d in (DOWNLOAD_DIR, FRAME_DIR, OUTPUT_DIR):
@@ -71,22 +98,13 @@ def scene_change_score(prev_frame, frame):
     if prev_frame is None:
         return 0
 
-    h1 = cv2.calcHist(
-        [prev_frame], [0], None, [64], [0, 256]
-    )
-
-    h2 = cv2.calcHist(
-        [frame], [0], None, [64], [0, 256]
-    )
+    h1 = cv2.calcHist([prev_frame], [0], None, [64], [0, 256])
+    h2 = cv2.calcHist([frame], [0], None, [64], [0, 256])
 
     cv2.normalize(h1, h1)
     cv2.normalize(h2, h2)
 
-    return int(
-        cv2.compareHist(
-            h1, h2, cv2.HISTCMP_BHATTACHARYYA
-        ) * 150
-    )
+    return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
 
 
 def motion_score(prev_gray, gray):
@@ -94,32 +112,17 @@ def motion_score(prev_gray, gray):
         return 0
 
     flow = cv2.calcOpticalFlowFarneback(
-        prev_gray,
-        gray,
-        None,
-        0.5,
-        3,
-        15,
-        3,
-        5,
-        1.2,
-        0
+        prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
     )
 
-    mag, _ = cv2.cartToPolar(
-        flow[..., 0],
-        flow[..., 1]
-    )
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
     return int(np.mean(mag) * 30)
 
 
 def body_score(frame):
     boxes, _ = hog.detectMultiScale(
-        frame,
-        winStride=(8, 8),
-        padding=(16, 16),
-        scale=1.05
+        frame, winStride=(8, 8), padding=(16, 16), scale=1.05
     )
 
     score = 0
@@ -127,7 +130,6 @@ def body_score(frame):
 
     for (x, y, bw, bh) in boxes:
         ratio = (bw * bh) / (w * h)
-
         if ratio > 0.20:
             score += 300
         elif ratio > 0.10:
@@ -138,70 +140,48 @@ def body_score(frame):
     return score, boxes
 
 
-async def process_video(
-    video_path,
-    user_id,
-    target,
-    status_msg
-):
+async def process_video(video_path, user_id, target, status_msg):
     """Process video and return ZIP path or None."""
 
+    if is_shutting_down():
+        await status_msg.edit("❌ Server restarting, please retry.")
+        return None
+
     if not os.path.exists(video_path):
-        await status_msg.edit(
-            "❌ Video file not found"
-        )
+        await status_msg.edit("❌ Video file not found")
         return None
 
     file_size = os.path.getsize(video_path)
-
     if file_size == 0:
-        await status_msg.edit(
-            "❌ Video file is empty"
-        )
+        await status_msg.edit("❌ Video file is empty")
         return None
 
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
-        await status_msg.edit(
-            "❌ Failed to open video file"
-        )
+        await status_msg.edit("❌ Failed to open video file")
         return None
 
-    total_frames = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
-
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     if total_frames == 0:
         cap.release()
-        await status_msg.edit(
-            "❌ Video has no frames"
-        )
+        await status_msg.edit("❌ Video has no frames")
         return None
 
     if fps <= 0:
         cap.release()
-        await status_msg.edit(
-            "❌ Invalid FPS"
-        )
+        await status_msg.edit("❌ Invalid FPS")
         return None
 
     duration = total_frames / fps
 
     if duration > 7200:
-        await status_msg.edit(
-            "❌ Video too long (max 120 minutes)"
-        )
+        await status_msg.edit("❌ Video too long (max 120 minutes)")
         cap.release()
         return None
 
-    step = max(
-        15,
-        total_frames // max(target, 1)
-    )
-
+    step = max(15, total_frames // max(target, 1))
     if step > 100:
         step = 50
 
@@ -210,16 +190,9 @@ async def process_video(
     prev_frame = None
     scored_frames = []
 
-    cancel_markup = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "❌ Cancel",
-                    callback_data="cancel"
-                )
-            ]
-        ]
-    )
+    cancel_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ])
 
     await status_msg.edit(
         f"🎞 Analysing video…\n"
@@ -230,19 +203,18 @@ async def process_video(
 
     # PASS 1: SCORING
     while cap.isOpened():
+        if is_shutting_down():
+            cap.release()
+            await status_msg.edit("❌ Server restarting, please retry.")
+            return None
 
         if cancel_users.get(user_id):
             cap.release()
-
-            await status_msg.edit(
-                "🛑 Cancelled by user."
-            )
-
+            await status_msg.edit("🛑 Cancelled by user.")
             cancel_users[user_id] = False
             return None
 
         ret, frame = cap.read()
-
         if not ret:
             break
 
@@ -252,16 +224,12 @@ async def process_video(
             await asyncio.sleep(0)
 
         if frame_index % 500 == 0:
-            progress = int(
-                (frame_index / total_frames) * 100
-            )
-
+            progress = int((frame_index / total_frames) * 100)
             try:
                 await status_msg.edit(
                     f"🎞 Analysing video…\n"
                     f"📊 Progress: {progress}%\n"
-                    f"📸 Frames processed: "
-                    f"{frame_index}/{total_frames}",
+                    f"📸 Frames processed: {frame_index}/{total_frames}",
                     reply_markup=cancel_markup
                 )
             except Exception:
@@ -272,35 +240,15 @@ async def process_video(
 
         if frame.shape[1] > 720:
             scale = 720 / frame.shape[1]
+            frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
 
-            frame = cv2.resize(
-                frame,
-                (
-                    720,
-                    int(frame.shape[0] * scale)
-                )
-            )
-
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        faces = face_cascade.detectMultiScale(
-            gray,
-            1.2,
-            5
-        )
-
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5)
         body_val, people_boxes = body_score(frame)
 
         try:
             nsfw = nsfw_scene_score(
-                frame,
-                faces,
-                people_boxes,
-                prev_frame,
-                prev_gray
+                frame, faces, people_boxes, prev_frame, prev_gray
             )
         except Exception:
             nsfw = 0
@@ -313,112 +261,72 @@ async def process_video(
             nsfw * 3.5
         )
 
-        scored_frames.append(
-            (total, frame_index)
-        )
-
+        scored_frames.append((total, frame_index))
         prev_gray = gray
         prev_frame = frame
 
     cap.release()
 
     if not scored_frames:
-        await status_msg.edit(
-            "❌ No frames analyzed"
-        )
+        await status_msg.edit("❌ No frames analyzed")
         return None
 
-    # SELECT BEST FRAMES
     scored_frames.sort(reverse=True)
-
-    selected_frames = sorted(
-        [
-            f
-            for _, f in scored_frames[:target]
-        ]
-    )
+    selected_frames = sorted([f for _, f in scored_frames[:target]])
 
     if not selected_frames:
-        await status_msg.edit(
-            "❌ No frames selected"
-        )
+        await status_msg.edit("❌ No frames selected")
         return None
 
     selected_set = set(selected_frames)
 
     # PASS 2: EXTRACTION
     cap = cv2.VideoCapture(video_path)
-
     if not cap.isOpened():
-        await status_msg.edit(
-            "❌ Failed to reopen video for extraction"
-        )
+        await status_msg.edit("❌ Failed to reopen video for extraction")
         return None
 
     current = 0
     saved = 0
 
-    await status_msg.edit(
-        "📸 Extracting frames…",
-        reply_markup=cancel_markup
-    )
+    await status_msg.edit("📸 Extracting frames…", reply_markup=cancel_markup)
 
     while cap.isOpened():
+        if is_shutting_down():
+            cap.release()
+            await status_msg.edit("❌ Server restarting, please retry.")
+            return None
 
         if cancel_users.get(user_id):
             cap.release()
-
-            await status_msg.edit(
-                "🛑 Cancelled by user."
-            )
-
+            await status_msg.edit("🛑 Cancelled by user.")
             cancel_users[user_id] = False
             return None
 
         ret, frame = cap.read()
-
         if not ret:
             break
 
         current += 1
-
         if current not in selected_set:
             continue
 
         if frame.shape[1] > 720:
             scale = 720 / frame.shape[1]
+            frame = cv2.resize(frame, (720, int(frame.shape[0] * scale)))
 
-            frame = cv2.resize(
-                frame,
-                (
-                    720,
-                    int(frame.shape[0] * scale)
-                )
-            )
-
-        frame_path = (
-            f"{FRAME_DIR}/{user_id}_{saved}.jpg"
-        )
-
+        frame_path = f"{FRAME_DIR}/{user_id}_{saved}.jpg"
         success = cv2.imwrite(
-            frame_path,
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
+            frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
         )
 
         if not success:
-            await status_msg.edit(
-                f"❌ Failed to save frame {saved}"
-            )
-
+            await status_msg.edit(f"❌ Failed to save frame {saved}")
             cap.release()
             return None
 
         saved += 1
-
-        progress = int(
-            (saved / target) * 100
-        )
+        progress = int((saved / target) * 100)
 
         await status_msg.edit(
             f"📸 Extracting frames…\n"
@@ -433,43 +341,23 @@ async def process_video(
     cap.release()
 
     if saved == 0:
-        await status_msg.edit(
-            "❌ No frames extracted"
-        )
+        await status_msg.edit("❌ No frames extracted")
         return None
 
     # CREATE ZIP
-    zip_path = (
-        f"{OUTPUT_DIR}/{user_id}_highlights.zip"
-    )
+    zip_path = f"{OUTPUT_DIR}/{user_id}_highlights.zip"
 
     try:
-        with zipfile.ZipFile(
-            zip_path,
-            "w"
-        ) as z:
-
+        with zipfile.ZipFile(zip_path, "w") as z:
             for i in range(saved):
-
-                frame_path = (
-                    f"{FRAME_DIR}/{user_id}_{i}.jpg"
-                )
-
+                frame_path = f"{FRAME_DIR}/{user_id}_{i}.jpg"
                 if os.path.exists(frame_path):
-                    z.write(
-                        frame_path,
-                        arcname=f"{i + 1}.jpg"
-                    )
+                    z.write(frame_path, arcname=f"{i + 1}.jpg")
                 else:
-                    await status_msg.edit(
-                        f"❌ Missing frame: {i}"
-                    )
+                    await status_msg.edit(f"❌ Missing frame: {i}")
                     return None
-
     except Exception as e:
-        await status_msg.edit(
-            f"❌ ZIP creation failed: {str(e)}"
-        )
+        await status_msg.edit(f"❌ ZIP creation failed: {str(e)}")
         return None
 
     try:
@@ -481,30 +369,20 @@ async def process_video(
     return zip_path
 
 
-# ---------------- CALLBACK HANDLER ----------------
+# ---------------- CALLBACK ----------------
 @bot.on_callback_query()
 async def callback(_, query):
-
     if query.data == "cancel":
         user_id = query.from_user.id
-
         cancel_users[user_id] = True
-
-        await query.answer(
-            "🛑 Cancelled processing!"
-        )
-
-        await query.message.edit(
-            "🛑 Processing cancelled."
-        )
+        await query.answer("🛑 Cancelled processing!")
+        await query.message.edit("🛑 Processing cancelled.")
 
 
 # ---------------- COMMANDS ----------------
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
-
     limits = get_current_limits()
-
     await msg.reply(
         f"🎬 **Video Highlight Bot**\n\n"
         f"Send me a video or use /url to get "
@@ -518,8 +396,7 @@ async def start(_, msg):
         f"• Cancel button\n\n"
         f"📦 **Limits:**\n"
         f"• Max Size: {limits['max_size_gb']} GB\n"
-        f"• Max Duration: "
-        f"{limits['max_duration_minutes']} minutes\n\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
         f"⚙ **Commands:**\n"
         f"/settings <1-200> - Set number of images\n"
         f"/url <video_url> - Process video from URL\n"
@@ -530,18 +407,13 @@ async def start(_, msg):
 
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
-
     if len(msg.command) < 2:
-        return await msg.reply(
-            "**Usage:** `/settings <1-200>`"
-        )
+        return await msg.reply("**Usage:** `/settings <1-200>`")
 
     try:
         count = int(msg.command[1])
     except ValueError:
-        return await msg.reply(
-            "❌ Please enter a valid number"
-        )
+        return await msg.reply("❌ Please enter a valid number")
 
     if count < 1 or count > MAX_LIMIT:
         return await msg.reply(
@@ -549,24 +421,17 @@ async def settings(_, msg):
         )
 
     set_count(msg.from_user.id, count)
-
-    await msg.reply(
-        f"✅ Image count set to **{count}**"
-    )
+    await msg.reply(f"✅ Image count set to **{count}**")
 
 
 @bot.on_message(filters.command("limits"))
 async def limits_command(_, msg):
-
     limits = get_current_limits()
-
     await msg.reply(
         f"📊 **Current Limits:**\n\n"
-        f"📦 **Max File Size:** "
-        f"{limits['max_size_gb']} GB "
+        f"📦 **Max File Size:** {limits['max_size_gb']} GB "
         f"({limits['max_size_mb']} MB)\n"
-        f"⏱️ **Max Duration:** "
-        f"{limits['max_duration_minutes']} minutes "
+        f"⏱️ **Max Duration:** {limits['max_duration_minutes']} minutes "
         f"({limits['max_duration_hours']} hours)\n\n"
         f"⚠️ Videos exceeding these limits will be rejected."
     )
@@ -574,64 +439,37 @@ async def limits_command(_, msg):
 
 @bot.on_message(filters.command("url"))
 async def url_handler(_, msg):
-
     user_id = msg.from_user.id
-    target = min(
-        get_count(user_id),
-        MAX_LIMIT
-    )
-
+    target = min(get_count(user_id), MAX_LIMIT)
     cancel_users[user_id] = False
 
     if len(msg.command) < 2:
         return await msg.reply(
             "**Usage:** `/url <video_url>`\n\n"
-            "**Example:** "
-            "`/url https://example.com/video.mp4`"
+            "**Example:** `/url https://example.com/video.mp4`"
         )
 
     url = msg.command[1].strip()
-
-    if not url.startswith(
-        ("http://", "https://")
-    ):
+    if not url.startswith(("http://", "https://")):
         return await msg.reply(
             "❌ Invalid URL. Please include http:// or https://"
         )
 
-    status = await msg.reply(
-        "🔍 **Checking video...**"
-    )
+    status = await msg.reply("🔍 **Checking video...**")
 
     try:
-        video_path = await download_with_status(
-            url,
-            status
-        )
-
+        video_path = await download_with_status(url, status)
         if not video_path:
             return
-
     except Exception as e:
-        return await status.edit(
-            f"❌ **Download failed**\n```{str(e)}```"
-        )
+        return await status.edit(f"❌ **Download failed**\n```{str(e)}```")
 
-    await status.edit(
-        "🎞 **Processing video...**"
-    )
+    await status.edit("🎞 **Processing video...**")
 
-    zip_path = await process_video(
-        video_path,
-        user_id,
-        target,
-        status
-    )
+    zip_path = await process_video(video_path, user_id, target, status)
 
     if not zip_path:
-        await status.edit(
-            "❌ **Processing failed**"
-        )
+        await status.edit("❌ **Processing failed**")
         return
 
     await msg.reply_document(
@@ -648,9 +486,7 @@ async def url_handler(_, msg):
     except Exception:
         pass
 
-    await status.edit(
-        "✅ **Done!** Check the ZIP file above."
-    )
+    await status.edit("✅ **Done!** Check the ZIP file above.")
 
     try:
         os.remove(video_path)
@@ -660,38 +496,19 @@ async def url_handler(_, msg):
 
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
-
     user_id = msg.from_user.id
-    target = min(
-        get_count(user_id),
-        MAX_LIMIT
-    )
-
+    target = min(get_count(user_id), MAX_LIMIT)
     cancel_users[user_id] = False
 
-    status = await msg.reply(
-        "⬇️ **Downloading video...**"
-    )
+    status = await msg.reply("⬇️ **Downloading video...**")
+    video_path = await msg.download(file_name=f"{DOWNLOAD_DIR}/")
 
-    video_path = await msg.download(
-        file_name=f"{DOWNLOAD_DIR}/"
-    )
+    await status.edit("🎞 **Processing video...**")
 
-    await status.edit(
-        "🎞 **Processing video...**"
-    )
-
-    zip_path = await process_video(
-        video_path,
-        user_id,
-        target,
-        status
-    )
+    zip_path = await process_video(video_path, user_id, target, status)
 
     if not zip_path:
-        await status.edit(
-            "❌ **Processing failed**"
-        )
+        await status.edit("❌ **Processing failed**")
         return
 
     await msg.reply_document(
@@ -708,9 +525,7 @@ async def video_handler(_, msg):
     except Exception:
         pass
 
-    await status.edit(
-        "✅ **Done!** Check the ZIP file above."
-    )
+    await status.edit("✅ **Done!** Check the ZIP file above.")
 
     try:
         os.remove(video_path)
@@ -718,12 +533,9 @@ async def video_handler(_, msg):
         pass
 
 
-# ---------------- HELP COMMAND ----------------
 @bot.on_message(filters.command("help"))
 async def help_command(_, msg):
-
     limits = get_current_limits()
-
     await msg.reply(
         f"**📖 Help Guide**\n\n"
         f"**How to use:**\n"
@@ -737,8 +549,7 @@ async def help_command(_, msg):
         f"• `/limits` - Show current limits\n\n"
         f"**Limits:**\n"
         f"• Max Size: {limits['max_size_gb']} GB\n"
-        f"• Max Duration: "
-        f"{limits['max_duration_minutes']} minutes\n\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
         f"**Features:**\n"
         f"• Smart scene detection\n"
         f"• Motion analysis\n"
@@ -756,19 +567,14 @@ async def help_command(_, msg):
     )
 
 
-# ---------------- UPSCALER COMMANDS ----------------
+# ---------------- UPSCALER ----------------
 @bot.on_message(filters.command("up"))
 async def up_command(_, msg):
-
     user_id = msg.from_user.id
-
     upscale_waiting.add(user_id)
     upscale_cancelled.discard(user_id)
     upscale_caption_waiting.discard(user_id)
-
-    upscale_captions[user_id] = (
-        "✅ 4× Image Upscaling Complete"
-    )
+    upscale_captions[user_id] = "✅ 4× Image Upscaling Complete"
 
     await msg.reply(
         "🖼️ **4× Image Upscaler**\n\n"
@@ -783,38 +589,27 @@ async def up_command(_, msg):
 
 @bot.on_message(filters.command("caption"))
 async def set_upscale_caption(_, msg):
-
     user_id = msg.from_user.id
 
     if user_id not in upscale_waiting:
-        return await msg.reply(
-            "❌ Start the upscaler first with `/up`."
-        )
+        return await msg.reply("❌ Start the upscaler first with `/up`.")
 
     if len(msg.command) < 2:
         return await msg.reply(
-            "📝 **Usage:**\n"
-            "`/caption Your custom caption`"
+            "📝 **Usage:**\n`/caption Your custom caption`"
         )
 
-    caption = msg.text.split(
-        " ",
-        1
-    )[1].strip()
+    caption = msg.text.split(" ", 1)[1].strip()
 
     if not caption:
-        return await msg.reply(
-            "❌ Caption cannot be empty."
-        )
+        return await msg.reply("❌ Caption cannot be empty.")
 
     if len(caption) > 1024:
         return await msg.reply(
-            "❌ Caption is too long.\n"
-            "Maximum: 1024 characters."
+            "❌ Caption is too long.\nMaximum: 1024 characters."
         )
 
     upscale_captions[user_id] = caption
-
     await msg.reply(
         "✅ **Custom caption saved.**\n\n"
         f"📝 {caption}\n\n"
@@ -824,101 +619,47 @@ async def set_upscale_caption(_, msg):
 
 @bot.on_message(filters.document)
 async def upscale_zip_handler(_, msg):
-
     user_id = msg.from_user.id
-
     if user_id not in upscale_waiting:
         return
 
-    filename = (
-        msg.document.file_name or ""
-    ).lower()
-
+    filename = (msg.document.file_name or "").lower()
     if not filename.endswith(".zip"):
-        return await msg.reply(
-            "❌ Please send a ZIP file."
-        )
+        return await msg.reply("❌ Please send a ZIP file.")
 
     upscale_waiting.discard(user_id)
     upscale_cancelled.discard(user_id)
 
     caption = upscale_captions.get(
-        user_id,
-        "✅ 4× Image Upscaling Complete"
+        user_id, "✅ 4× Image Upscaling Complete"
     )
 
-    status = await msg.reply(
-        "📦 **ZIP received**\n"
-        "⬇️ Downloading..."
-    )
+    status = await msg.reply("📦 **ZIP received**\n⬇️ Downloading...")
 
-    user_dir = os.path.join(
-        "upscale_work",
-        str(user_id)
-    )
+    user_dir = os.path.join("upscale_work", str(user_id))
 
     try:
-        os.makedirs(
-            user_dir,
-            exist_ok=True
-        )
-
+        os.makedirs(user_dir, exist_ok=True)
         zip_path = await msg.download(
-            file_name=os.path.join(
-                user_dir,
-                "input.zip"
-            )
+            file_name=os.path.join(user_dir, "input.zip")
         )
-
     except Exception as e:
-
         cleanup_user(user_id)
+        upscale_captions.pop(user_id, None)
+        return await status.edit(f"❌ **Download failed**\n\n{e}")
 
-        upscale_captions.pop(
-            user_id,
-            None
-        )
-
-        return await status.edit(
-            f"❌ **Download failed**\n\n{e}"
-        )
-
-    await status.edit(
-        "📂 **ZIP received successfully**\n\n"
-        "🔍 Finding images..."
-    )
+    await status.edit("📂 **ZIP received successfully**\n\n🔍 Finding images...")
 
     loop = asyncio.get_running_loop()
+    last_update = {"percent": -1}
 
-    last_update = {
-        "percent": -1
-    }
-
-    async def update_status(
-        percent,
-        current,
-        total
-    ):
-
-        if (
-            percent == last_update["percent"]
-            and percent != 100
-        ):
+    async def update_status(percent, current, total):
+        if percent == last_update["percent"] and percent != 100:
             return
-
         last_update["percent"] = percent
-
         bar_length = 12
-
-        filled = int(
-            bar_length * percent / 100
-        )
-
-        bar = (
-            "█" * filled +
-            "░" * (bar_length - filled)
-        )
-
+        filled = int(bar_length * percent / 100)
+        bar = "█" * filled + "░" * (bar_length - filled)
         try:
             await status.edit(
                 "🖼️ **Upscaling Images**\n\n"
@@ -931,109 +672,48 @@ async def upscale_zip_handler(_, msg):
         except Exception:
             pass
 
-    def progress_callback(
-        percent,
-        current,
-        total
-    ):
-
+    def progress_callback(percent, current, total):
         try:
             asyncio.run_coroutine_threadsafe(
-                update_status(
-                    percent,
-                    current,
-                    total
-                ),
-                loop
+                update_status(percent, current, total), loop
             )
         except Exception:
             pass
 
     def cancel_callback():
-        return (
-            user_id in upscale_cancelled
-        )
+        return user_id in upscale_cancelled or is_shutting_down()
 
     try:
-        (
-            output_zip,
-            processed,
-            failed,
-            cancelled
-        ) = await asyncio.to_thread(
-            process_zip,
-            zip_path,
-            user_id,
-            4,
-            progress_callback,
-            cancel_callback
+        (output_zip, processed, failed, cancelled) = await asyncio.to_thread(
+            process_zip, zip_path, user_id, 4,
+            progress_callback, cancel_callback
         )
-
     except Exception as e:
-
         cleanup_user(user_id)
-
-        upscale_cancelled.discard(
-            user_id
-        )
-
-        upscale_captions.pop(
-            user_id,
-            None
-        )
-
-        return await status.edit(
-            "❌ **Upscaling failed**\n\n"
-            f"{e}"
-        )
+        upscale_cancelled.discard(user_id)
+        upscale_captions.pop(user_id, None)
+        return await status.edit(f"❌ **Upscaling failed**\n\n{e}")
 
     if cancelled:
-
         cleanup_user(user_id)
-
-        upscale_cancelled.discard(
-            user_id
-        )
-
-        upscale_captions.pop(
-            user_id,
-            None
-        )
-
+        upscale_cancelled.discard(user_id)
+        upscale_captions.pop(user_id, None)
         return await status.edit(
             "🛑 **Upscaling cancelled.**\n\n"
-            f"📸 Processed before cancellation: "
-            f"**{processed}**"
+            f"📸 Processed before cancellation: **{processed}**"
         )
 
-    if (
-        not output_zip
-        or not os.path.exists(output_zip)
-    ):
-
+    if not output_zip or not os.path.exists(output_zip):
         cleanup_user(user_id)
-
-        upscale_captions.pop(
-            user_id,
-            None
-        )
-
-        return await status.edit(
-            "❌ **Output ZIP was not created.**"
-        )
+        upscale_captions.pop(user_id, None)
+        return await status.edit("❌ **Output ZIP was not created.**")
 
     await status.edit(
-        "📦 **Upscaling complete!**\n\n"
-        "⬆️ Uploading final ZIP..."
+        "📦 **Upscaling complete!**\n\n⬆️ Uploading final ZIP..."
     )
 
     try:
-
-        await msg.reply_document(
-            output_zip,
-            caption=caption
-        )
-
+        await msg.reply_document(output_zip, caption=caption)
         await status.edit(
             "✅ **Done!**\n\n"
             f"🖼️ Processed: **{processed}**\n"
@@ -1041,73 +721,31 @@ async def upscale_zip_handler(_, msg):
             "🔍 Scale: **4×**\n"
             "📦 Output: ZIP"
         )
-
     except Exception as e:
-
-        await status.edit(
-            "❌ **Failed to send ZIP**\n\n"
-            f"{e}"
-        )
-
+        await status.edit(f"❌ **Failed to send ZIP**\n\n{e}")
     finally:
-
         cleanup_user(user_id)
-
-        upscale_cancelled.discard(
-            user_id
-        )
-
-        upscale_caption_waiting.discard(
-            user_id
-        )
-
-        upscale_captions.pop(
-            user_id,
-            None
-        )
+        upscale_cancelled.discard(user_id)
+        upscale_caption_waiting.discard(user_id)
+        upscale_captions.pop(user_id, None)
 
 
-# ============================================================
-# /cancel
-# ============================================================
 @bot.on_message(filters.command("cancel"))
 async def cancel_upscale(_, msg):
-
     user_id = msg.from_user.id
 
     if user_id in upscale_waiting:
-
-        upscale_waiting.discard(
-            user_id
-        )
-
-        upscale_caption_waiting.discard(
-            user_id
-        )
-
-        upscale_cancelled.discard(
-            user_id
-        )
-
-        upscale_captions.pop(
-            user_id,
-            None
-        )
-
+        upscale_waiting.discard(user_id)
+        upscale_caption_waiting.discard(user_id)
+        upscale_cancelled.discard(user_id)
+        upscale_captions.pop(user_id, None)
         cleanup_user(user_id)
+        return await msg.reply("🛑 **Upscaler cancelled.**")
 
-        return await msg.reply(
-            "🛑 **Upscaler cancelled.**"
-        )
-
-    upscale_cancelled.add(
-        user_id
-    )
-
+    upscale_cancelled.add(user_id)
     await msg.reply(
         "🛑 **Cancel requested.**\n\n"
-        "The current image will finish, "
-        "then processing will stop."
+        "The current image will finish, then processing will stop."
     )
 
 
@@ -1116,3 +754,55 @@ async def cancel_upscale(_, msg):
 # Keep this at the VERY BOTTOM of bot.py
 # ============================================================
 register_image_video_handlers(bot)
+
+
+# ============================================================
+# GRACEFUL SHUTDOWN LOOP
+# Replaces plain bot.run() from app.py's perspective.
+# ============================================================
+
+def run_bot_forever():
+    """
+    Run Pyrogram until shutdown flag is set.
+
+    Pyrogram's `bot.run()` blocks and doesn't check any external flag,
+    so we install our own loop. When shutdown is requested we call
+    `bot.stop()` which cleanly closes the client.
+    """
+    log.info("bot starting")
+
+    # Install signal handlers here too so SIGTERM works even if
+    # app.py didn't install them first (e.g. running bot.py directly).
+    def _on_signal(signum, _frame):
+        log.warning("signal %s received in bot process", signum)
+        request_shutdown()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError) as error:
+            log.warning("could not install handler for %s: %s", sig, error)
+
+    async def _run():
+        await bot.start()
+        log.info("bot started")
+
+        # Keep the event loop alive; exit when shutdown is requested.
+        while not is_shutting_down():
+            await asyncio.sleep(1.0)
+
+        log.info("shutdown requested - stopping bot")
+        try:
+            await bot.stop()
+            log.info("bot stopped cleanly")
+        except Exception as error:
+            log.warning("bot.stop error: %s", error)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        log.info("KeyboardInterrupt - exiting bot")
+    except Exception as error:
+        log.exception("bot loop error: %s", error)
+    finally:
+        log.info("bot process exiting")
