@@ -31,12 +31,8 @@ log = logging.getLogger("bot")
 SHUTDOWN_FLAG = os.environ.get("SHUTDOWN_FLAG", "/tmp/shutdown.flag")
 _shutdown_event = threading.Event()
 
-# NEW: process start time for /heal uptime fallback
+# Process start time for /heal uptime fallback
 _BOT_START_TIME = time.time()
-
-
-def is_shutting_down():
-    return _shutdown_event.is_set() or os.path.exists(SHUTDOWN_FLAG)
 
 
 def request_shutdown():
@@ -44,9 +40,25 @@ def request_shutdown():
     _shutdown_event.set()
     try:
         with open(SHUTDOWN_FLAG, "w") as f:
-            f.write("1")
+            f.write(str(os.getpid()))  # remember which PID wrote it
     except Exception as error:
         log.warning("could not write shutdown flag: %s", error)
+
+
+def is_shutting_down():
+    if _shutdown_event.is_set():
+        return True
+    if not os.path.exists(SHUTDOWN_FLAG):
+        return False
+    # Ignore flags written by a previous process (stale from last deploy).
+    try:
+        with open(SHUTDOWN_FLAG) as f:
+            writer = f.read().strip()
+        if writer and writer != str(os.getpid()):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 # ---------------- STATE ----------------
@@ -107,7 +119,7 @@ def scene_change_score(prev_frame, frame):
     cv2.normalize(h1, h1)
     cv2.normalize(h2, h2)
 
-    return int(cv2.compareHist(h1, h2, cv2.HISTCMP_BHATTACHARYYA) * 150)
+    return int(cv2.compareHist(h1, h2, cv2.CMP_BHATTACHARYYA if hasattr(cv2, "CMP_BHATTACHARYYA") else cv2.HISTCMP_BHATTACHARYYA) * 150)
 
 
 def motion_score(prev_gray, gray):
@@ -753,7 +765,7 @@ async def cancel_upscale(_, msg):
 
 
 # ============================================================
-# /heal and /health — server health check (NEW)
+# /heal and /health — server health check
 # ============================================================
 
 def _human_uptime(seconds):
@@ -795,20 +807,17 @@ async def _health_report():
     try:
         with open("/proc/self/stat") as f:
             stat = f.read().split()
-        # Field 22 (index 21) is starttime in clock ticks since boot.
         starttime_ticks = int(stat[21])
         clock_ticks_per_sec = os.sysconf("SC_CLK_TCK")
-        # Time since boot (Linux clock_gettime with CLOCK_BOOTTIME)
         boot_seconds = time.clock_gettime(time.CLOCK_BOOTTIME)
-        process_age = boot_seconds - (starttime_ticks / clock_ticks_per_sec)
-        uptime_seconds = process_age
+        uptime_seconds = boot_seconds - (starttime_ticks / clock_ticks_per_sec)
     except Exception:
         uptime_seconds = None
 
     if uptime_seconds is None or uptime_seconds <= 0:
         uptime_seconds = time.time() - _BOT_START_TIME
 
-    # Memory (RSS) from /proc/self/status
+    # Memory (RSS)
     mem_mb = None
     try:
         with open("/proc/self/status") as f:
@@ -819,7 +828,7 @@ async def _health_report():
     except Exception:
         pass
 
-    # Disk usage of the project root
+    # Disk usage of project root
     try:
         disk = _shutil.disk_usage(".")
         disk_used_pct = (disk.used / disk.total) * 100
@@ -828,12 +837,10 @@ async def _health_report():
         disk_used_pct = None
         disk_free_gb = None
 
-    # Work dirs
     iv_work_mb = _dir_size_mb("image_video_work")
     downloads_mb = _dir_size_mb(DOWNLOAD_DIR)
     output_mb = _dir_size_mb(OUTPUT_DIR)
 
-    # Active sessions
     try:
         from image_video import sessions as iv_sessions
         iv_count = len(iv_sessions)
@@ -842,13 +849,11 @@ async def _health_report():
     upscale_count = len(upscale_waiting)
     video_busy = sum(1 for v in cancel_users.values() if v)
 
-    # Bot connection state
     try:
         connected = bot.is_connected
     except Exception:
         connected = False
 
-    # Flask reachable?
     flask_ok = False
     try:
         import requests as _requests
@@ -921,14 +926,22 @@ def run_bot_forever():
     """
     Run Pyrogram until shutdown flag is set.
 
-    Pyrogram's `bot.run()` blocks and doesn't check any external flag,
-    so we install our own loop. When shutdown is requested we call
-    `bot.stop()` which cleanly closes the client.
+    Handles:
+    - stale shutdown flags from a previous deploy on the same container
+    - Pyrogram connection drops (auto-restart every 60s check)
+    - clean shutdown on SIGTERM
     """
+    # Clear stale shutdown flag from a previous process on this container.
+    try:
+        if os.path.exists(SHUTDOWN_FLAG):
+            os.remove(SHUTDOWN_FLAG)
+            log.warning("removed stale shutdown flag %s at startup",
+                        SHUTDOWN_FLAG)
+    except Exception as error:
+        log.warning("could not clear stale shutdown flag: %s", error)
+
     log.info("bot starting")
 
-    # Install signal handlers here too so SIGTERM works even if
-    # app.py didn't install them first (e.g. running bot.py directly).
     def _on_signal(signum, _frame):
         log.warning("signal %s received in bot process", signum)
         request_shutdown()
@@ -941,10 +954,26 @@ def run_bot_forever():
 
     async def _run():
         await bot.start()
-        log.info("bot started")
+        log.info("bot started (connected=%s)", bot.is_connected)
 
-        # Keep the event loop alive; exit when shutdown is requested.
+        last_health = 0.0
         while not is_shutting_down():
+            now = time.time()
+            if now - last_health >= 60:
+                try:
+                    connected = bot.is_connected
+                except Exception:
+                    connected = False
+                if not connected:
+                    log.warning("pyrogram connection dropped, restarting")
+                    try:
+                        await bot.stop()
+                        await bot.start()
+                        log.info("pyrogram restarted (connected=%s)",
+                                 bot.is_connected)
+                    except Exception as error:
+                        log.exception("pyrogram restart failed: %s", error)
+                last_health = now
             await asyncio.sleep(1.0)
 
         log.info("shutdown requested - stopping bot")
@@ -962,3 +991,8 @@ def run_bot_forever():
         log.exception("bot loop error: %s", error)
     finally:
         log.info("bot process exiting")
+        try:
+            if os.path.exists(SHUTDOWN_FLAG):
+                os.remove(SHUTDOWN_FLAG)
+        except Exception:
+            pass
