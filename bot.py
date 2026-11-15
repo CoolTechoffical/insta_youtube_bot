@@ -31,6 +31,9 @@ log = logging.getLogger("bot")
 SHUTDOWN_FLAG = os.environ.get("SHUTDOWN_FLAG", "/tmp/shutdown.flag")
 _shutdown_event = threading.Event()
 
+# NEW: process start time for /heal uptime fallback
+_BOT_START_TIME = time.time()
+
 
 def is_shutting_down():
     return _shutdown_event.is_set() or os.path.exists(SHUTDOWN_FLAG)
@@ -747,6 +750,159 @@ async def cancel_upscale(_, msg):
         "🛑 **Cancel requested.**\n\n"
         "The current image will finish, then processing will stop."
     )
+
+
+# ============================================================
+# /heal and /health — server health check (NEW)
+# ============================================================
+
+def _human_uptime(seconds):
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _dir_size_mb(path):
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total / (1024 * 1024)
+
+
+async def _health_report():
+    """Build the health report string. Shared by /heal and /health."""
+    import shutil as _shutil
+
+    # Uptime: prefer reading process start from /proc/self/stat (Linux).
+    uptime_seconds = None
+    try:
+        with open("/proc/self/stat") as f:
+            stat = f.read().split()
+        # Field 22 (index 21) is starttime in clock ticks since boot.
+        starttime_ticks = int(stat[21])
+        clock_ticks_per_sec = os.sysconf("SC_CLK_TCK")
+        # Time since boot (Linux clock_gettime with CLOCK_BOOTTIME)
+        boot_seconds = time.clock_gettime(time.CLOCK_BOOTTIME)
+        process_age = boot_seconds - (starttime_ticks / clock_ticks_per_sec)
+        uptime_seconds = process_age
+    except Exception:
+        uptime_seconds = None
+
+    if uptime_seconds is None or uptime_seconds <= 0:
+        uptime_seconds = time.time() - _BOT_START_TIME
+
+    # Memory (RSS) from /proc/self/status
+    mem_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    mem_mb = int(line.split()[1]) / 1024.0
+                    break
+    except Exception:
+        pass
+
+    # Disk usage of the project root
+    try:
+        disk = _shutil.disk_usage(".")
+        disk_used_pct = (disk.used / disk.total) * 100
+        disk_free_gb = disk.free / (1024 ** 3)
+    except Exception:
+        disk_used_pct = None
+        disk_free_gb = None
+
+    # Work dirs
+    iv_work_mb = _dir_size_mb("image_video_work")
+    downloads_mb = _dir_size_mb(DOWNLOAD_DIR)
+    output_mb = _dir_size_mb(OUTPUT_DIR)
+
+    # Active sessions
+    try:
+        from image_video import sessions as iv_sessions
+        iv_count = len(iv_sessions)
+    except Exception:
+        iv_count = 0
+    upscale_count = len(upscale_waiting)
+    video_busy = sum(1 for v in cancel_users.values() if v)
+
+    # Bot connection state
+    try:
+        connected = bot.is_connected
+    except Exception:
+        connected = False
+
+    # Flask reachable?
+    flask_ok = False
+    try:
+        import requests as _requests
+        port = os.environ.get("PORT", "10000")
+        r = _requests.get(f"http://127.0.0.1:{port}/health", timeout=3)
+        flask_ok = r.status_code == 200
+    except Exception:
+        flask_ok = False
+
+    shutting = is_shutting_down()
+
+    lines = [
+        "🏥 **Server Health Report**",
+        "",
+        "**Process**",
+        f"⏱️ Uptime: `{_human_uptime(uptime_seconds)}`",
+    ]
+    if mem_mb is not None:
+        lines.append(f"💾 Memory (RSS): `{mem_mb:.1f} MB`")
+    lines.append(f"🔁 Shutting down: `{'yes' if shutting else 'no'}`")
+
+    lines.append("")
+    lines.append("**Services**")
+    lines.append(f"🤖 Pyrogram: `{'connected' if connected else 'disconnected'}`")
+    lines.append(f"🌐 Flask (127.0.0.1): `{'ok' if flask_ok else 'unreachable'}`")
+
+    lines.append("")
+    lines.append("**Disk**")
+    if disk_used_pct is not None:
+        lines.append(
+            f"💽 Disk used: `{disk_used_pct:.1f}%` "
+            f"(free `{disk_free_gb:.2f} GB`)"
+        )
+    lines.append(f"📁 image_video_work: `{iv_work_mb:.1f} MB`")
+    lines.append(f"📁 downloads: `{downloads_mb:.1f} MB`")
+    lines.append(f"📁 output: `{output_mb:.1f} MB`")
+
+    lines.append("")
+    lines.append("**Workload**")
+    lines.append(f"🎬 Image→video sessions: `{iv_count}`")
+    lines.append(f"🖼️ Upscaler waiting: `{upscale_count}`")
+    lines.append(f"🔄 Video jobs in progress: `{video_busy}`")
+
+    return "\n".join(lines)
+
+
+@bot.on_message(filters.command(["heal", "health"]))
+async def health_command(_, msg):
+    try:
+        report = await _health_report()
+        await msg.reply(report)
+    except Exception as error:
+        log.exception("health report failed: %s", error)
+        await msg.reply(f"❌ Health check failed: `{str(error)[:300]}`")
 
 
 # ============================================================
