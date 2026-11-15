@@ -40,7 +40,7 @@ def request_shutdown():
     _shutdown_event.set()
     try:
         with open(SHUTDOWN_FLAG, "w") as f:
-            f.write(str(os.getpid()))  # remember which PID wrote it
+            f.write(str(os.getpid()))
     except Exception as error:
         log.warning("could not write shutdown flag: %s", error)
 
@@ -119,7 +119,11 @@ def scene_change_score(prev_frame, frame):
     cv2.normalize(h1, h1)
     cv2.normalize(h2, h2)
 
-    return int(cv2.compareHist(h1, h2, cv2.CMP_BHATTACHARYYA if hasattr(cv2, "CMP_BHATTACHARYYA") else cv2.HISTCMP_BHATTACHARYYA) * 150)
+    try:
+        method = cv2.HISTCMP_BHATTACHARYYA
+    except AttributeError:
+        method = cv2.CMP_BHATTACHARYYA
+    return int(cv2.compareHist(h1, h2, method) * 150)
 
 
 def motion_score(prev_gray, gray):
@@ -928,6 +932,7 @@ def run_bot_forever():
 
     Handles:
     - stale shutdown flags from a previous deploy on the same container
+    - stale Pyrogram session files that cause silent "connected but dead" state
     - Pyrogram connection drops (auto-restart every 60s check)
     - clean shutdown on SIGTERM
     """
@@ -939,6 +944,18 @@ def run_bot_forever():
                         SHUTDOWN_FLAG)
     except Exception as error:
         log.warning("could not clear stale shutdown flag: %s", error)
+
+    # Delete stale Pyrogram session files so a fresh auth is created.
+    for session_file in (
+        "highlight_bot.session",
+        "highlight_bot.session-journal",
+    ):
+        try:
+            if os.path.exists(session_file):
+                os.remove(session_file)
+                log.warning("deleted stale session file %s", session_file)
+        except Exception as error:
+            log.warning("could not delete %s: %s", session_file, error)
 
     log.info("bot starting")
 
@@ -955,6 +972,14 @@ def run_bot_forever():
     async def _run():
         await bot.start()
         log.info("bot started (connected=%s)", bot.is_connected)
+
+        # Verify the bot can actually call the Telegram API.
+        try:
+            me = await bot.get_me()
+            log.info("bot identity: @%s (id=%s)", me.username, me.id)
+        except Exception as error:
+            log.exception("get_me failed - bot cannot reach Telegram API: %s",
+                          error)
 
         last_health = 0.0
         while not is_shutting_down():
