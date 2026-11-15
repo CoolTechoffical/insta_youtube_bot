@@ -1,4 +1,3 @@
-
 import os
 import cv2
 import zipfile
@@ -9,6 +8,7 @@ import signal
 import threading
 import logging
 import time
+import requests
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -34,7 +34,6 @@ SHUTDOWN_FLAG = os.environ.get(
 )
 
 _shutdown_event = threading.Event()
-
 _BOT_START_TIME = time.time()
 
 
@@ -98,15 +97,23 @@ face_cascade = cv2.CascadeClassifier(
 )
 
 if face_cascade.empty():
-    raise RuntimeError(
-        "Failed to load OpenCV Haar cascade"
-    )
+    raise RuntimeError("Failed to load OpenCV Haar cascade")
 
 hog = cv2.HOGDescriptor()
-
 hog.setSVMDetector(
     cv2.HOGDescriptor_getDefaultPeopleDetector()
 )
+
+
+# ---------------- SINGLE PYROGRAM EVENT LOOP ----------------
+#
+# IMPORTANT:
+# Pyrogram's Client captures an event loop during construction.
+# Create and install the loop BEFORE constructing Client.
+# Do not use asyncio.run() for this Client.
+
+_BOT_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(_BOT_LOOP)
 
 
 # ---------------- BOT ----------------
@@ -128,7 +135,6 @@ def scene_change_score(prev_frame, frame):
     h1 = cv2.calcHist(
         [prev_frame], [0], None, [64], [0, 256]
     )
-
     h2 = cv2.calcHist(
         [frame], [0], None, [64], [0, 256]
     )
@@ -141,9 +147,7 @@ def scene_change_score(prev_frame, frame):
     except AttributeError:
         method = cv2.CMP_BHATTACHARYYA
 
-    return int(
-        cv2.compareHist(h1, h2, method) * 150
-    )
+    return int(cv2.compareHist(h1, h2, method) * 150)
 
 
 def motion_score(prev_gray, gray):
@@ -201,9 +205,7 @@ async def process_video(video_path, user_id, target, status_msg):
     """Process video and return ZIP path or None."""
 
     if is_shutting_down():
-        await status_msg.edit(
-            "Server restarting, please retry."
-        )
+        await status_msg.edit("Server restarting, please retry.")
         return None
 
     if not os.path.exists(video_path):
@@ -219,15 +221,10 @@ async def process_video(video_path, user_id, target, status_msg):
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
-        await status_msg.edit(
-            "Failed to open video file"
-        )
+        await status_msg.edit("Failed to open video file")
         return None
 
-    total_frames = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
-
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
     if total_frames == 0:
@@ -249,10 +246,7 @@ async def process_video(video_path, user_id, target, status_msg):
         )
         return None
 
-    step = max(
-        15,
-        total_frames // max(target, 1)
-    )
+    step = max(15, total_frames // max(target, 1))
 
     if step > 100:
         step = 50
@@ -281,7 +275,6 @@ async def process_video(video_path, user_id, target, status_msg):
     # PASS 1: SCORING
 
     while cap.isOpened():
-
         if is_shutting_down():
             cap.release()
             await status_msg.edit(
@@ -291,9 +284,7 @@ async def process_video(video_path, user_id, target, status_msg):
 
         if cancel_users.get(user_id):
             cap.release()
-            await status_msg.edit(
-                "Processing cancelled."
-            )
+            await status_msg.edit("Processing cancelled.")
             cancel_users[user_id] = False
             return None
 
@@ -308,16 +299,13 @@ async def process_video(video_path, user_id, target, status_msg):
             await asyncio.sleep(0)
 
         if frame_index % 500 == 0:
-            progress = int(
-                (frame_index / total_frames) * 100
-            )
+            progress = int((frame_index / total_frames) * 100)
 
             try:
                 await status_msg.edit(
                     f"Analysing video...\n"
                     f"Progress: {progress}%\n"
-                    f"Frames processed: "
-                    f"{frame_index}/{total_frames}",
+                    f"Frames processed: {frame_index}/{total_frames}",
                     reply_markup=cancel_markup
                 )
             except Exception:
@@ -328,19 +316,12 @@ async def process_video(video_path, user_id, target, status_msg):
 
         if frame.shape[1] > 720:
             scale = 720 / frame.shape[1]
-
             frame = cv2.resize(
                 frame,
-                (
-                    720,
-                    int(frame.shape[0] * scale)
-                )
+                (720, int(frame.shape[0] * scale))
             )
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         faces = face_cascade.detectMultiScale(
             gray,
@@ -369,31 +350,25 @@ async def process_video(video_path, user_id, target, status_msg):
             + nsfw * 3.5
         )
 
-        scored_frames.append(
-            (total, frame_index)
-        )
-
+        scored_frames.append((total, frame_index))
         prev_gray = gray
         prev_frame = frame
 
     cap.release()
 
     if not scored_frames:
-        await status_msg.edit(
-            "No frames analysed"
-        )
+        await status_msg.edit("No frames analysed")
         return None
 
     scored_frames.sort(reverse=True)
 
     selected_frames = sorted([
-        f for _, f in scored_frames[:target]
+        frame_number
+        for _, frame_number in scored_frames[:target]
     ])
 
     if not selected_frames:
-        await status_msg.edit(
-            "No frames selected"
-        )
+        await status_msg.edit("No frames selected")
         return None
 
     selected_set = set(selected_frames)
@@ -416,97 +391,93 @@ async def process_video(video_path, user_id, target, status_msg):
         str(user_id)
     )
 
-    os.makedirs(
-        user_frame_dir,
-        exist_ok=True
-    )
+    os.makedirs(user_frame_dir, exist_ok=True)
+
+    # Remove leftover frames from an earlier interrupted job.
+    for old_name in os.listdir(user_frame_dir):
+        old_path = os.path.join(user_frame_dir, old_name)
+        try:
+            if os.path.isfile(old_path):
+                os.remove(old_path)
+        except OSError:
+            pass
 
     await status_msg.edit(
         "Extracting frames...",
         reply_markup=cancel_markup
     )
 
-    while cap.isOpened():
-
-        if is_shutting_down():
-            cap.release()
-            await status_msg.edit(
-                "Server restarting, please retry."
-            )
-            return None
-
-        if cancel_users.get(user_id):
-            cap.release()
-            await status_msg.edit(
-                "Processing cancelled."
-            )
-            cancel_users[user_id] = False
-            return None
-
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        current += 1
-
-        if current not in selected_set:
-            continue
-
-        if frame.shape[1] > 720:
-            scale = 720 / frame.shape[1]
-
-            frame = cv2.resize(
-                frame,
-                (
-                    720,
-                    int(frame.shape[0] * scale)
+    try:
+        while cap.isOpened():
+            if is_shutting_down():
+                await status_msg.edit(
+                    "Server restarting, please retry."
                 )
+                return None
+
+            if cancel_users.get(user_id):
+                await status_msg.edit("Processing cancelled.")
+                cancel_users[user_id] = False
+                return None
+
+            ret, frame = cap.read()
+
+            if not ret:
+                break
+
+            current += 1
+
+            if current not in selected_set:
+                continue
+
+            if frame.shape[1] > 720:
+                scale = 720 / frame.shape[1]
+                frame = cv2.resize(
+                    frame,
+                    (720, int(frame.shape[0] * scale))
+                )
+
+            frame_path = os.path.join(
+                user_frame_dir,
+                f"{saved}.jpg"
             )
 
-        frame_path = os.path.join(
-            user_frame_dir,
-            f"{saved}.jpg"
-        )
-
-        success = cv2.imwrite(
-            frame_path,
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, 95]
-        )
-
-        if not success:
-            await status_msg.edit(
-                f"Failed to save frame {saved}"
+            success = cv2.imwrite(
+                frame_path,
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 95]
             )
-            cap.release()
-            return None
 
-        saved += 1
+            if not success:
+                await status_msg.edit(
+                    f"Failed to save frame {saved}"
+                )
+                return None
 
-        progress = int(
-            (saved / len(selected_frames)) * 100
-        )
+            saved += 1
 
-        try:
-            await status_msg.edit(
-                f"Extracting frames...\n"
-                f"Progress: {progress}%\n"
-                f"Saved: {saved}/{len(selected_frames)}",
-                reply_markup=cancel_markup
+            progress = int(
+                (saved / len(selected_frames)) * 100
             )
-        except Exception:
-            pass
 
-        if saved >= len(selected_frames):
-            break
+            try:
+                await status_msg.edit(
+                    f"Extracting frames...\n"
+                    f"Progress: {progress}%\n"
+                    f"Saved: {saved}/{len(selected_frames)}",
+                    reply_markup=cancel_markup
+                )
+            except Exception:
+                pass
 
-    cap.release()
+            if saved >= len(selected_frames):
+                break
+
+    finally:
+        cap.release()
 
     if saved == 0:
-        await status_msg.edit(
-            "No frames extracted"
-        )
+        await status_msg.edit("No frames extracted")
         return None
 
     # CREATE ZIP
@@ -522,9 +493,7 @@ async def process_video(video_path, user_id, target, status_msg):
             "w",
             zipfile.ZIP_DEFLATED
         ) as archive:
-
             for i in range(saved):
-
                 frame_path = os.path.join(
                     user_frame_dir,
                     f"{i}.jpg"
@@ -560,10 +529,8 @@ async def process_video(video_path, user_id, target, status_msg):
 
 @bot.on_callback_query()
 async def callback(_, query):
-
     if query.data == "cancel":
         user_id = query.from_user.id
-
         cancel_users[user_id] = True
 
         await query.answer(
@@ -582,7 +549,6 @@ async def callback(_, query):
 
 @bot.on_message(filters.command("start"))
 async def start(_, msg):
-
     limits = get_current_limits()
 
     await msg.reply(
@@ -598,8 +564,7 @@ async def start(_, msg):
         f"• Cancel button\n\n"
         f"📦 **Limits:**\n"
         f"• Max Size: {limits['max_size_gb']} GB\n"
-        f"• Max Duration: "
-        f"{limits['max_duration_minutes']} minutes\n\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
         f"⚙ **Commands:**\n"
         f"/settings <1-200> - Set number of images\n"
         f"/url <video_url> - Process video from URL\n"
@@ -610,7 +575,6 @@ async def start(_, msg):
 
 @bot.on_message(filters.command("settings"))
 async def settings(_, msg):
-
     if len(msg.command) < 2:
         return await msg.reply(
             "**Usage:** `/settings <1-200>`"
@@ -637,14 +601,12 @@ async def settings(_, msg):
 
 @bot.on_message(filters.command("limits"))
 async def limits_command(_, msg):
-
     limits = get_current_limits()
 
     await msg.reply(
         f"📊 **Current Limits:**\n\n"
         f"📦 **Max File Size:** "
-        f"{limits['max_size_gb']} GB "
-        f"({limits['max_size_mb']} MB)\n"
+        f"{limits['max_size_gb']} GB ({limits['max_size_mb']} MB)\n"
         f"⏱️ **Max Duration:** "
         f"{limits['max_duration_minutes']} minutes "
         f"({limits['max_duration_hours']} hours)\n\n"
@@ -654,21 +616,14 @@ async def limits_command(_, msg):
 
 @bot.on_message(filters.command("url"))
 async def url_handler(_, msg):
-
     user_id = msg.from_user.id
-
-    target = min(
-        get_count(user_id),
-        MAX_LIMIT
-    )
-
+    target = min(get_count(user_id), MAX_LIMIT)
     cancel_users[user_id] = False
 
     if len(msg.command) < 2:
         return await msg.reply(
             "**Usage:** `/url <video_url>`\n\n"
-            "**Example:** "
-            "`/url https://example.com/video.mp4`"
+            "**Example:** `/url https://example.com/video.mp4`"
         )
 
     url = msg.command[1].strip()
@@ -678,29 +633,18 @@ async def url_handler(_, msg):
             "Invalid URL. Please include http:// or https://"
         )
 
-    status = await msg.reply(
-        "Checking video..."
-    )
+    status = await msg.reply("Checking video...")
+    video_path = None
+    zip_path = None
 
     try:
-        video_path = await download_with_status(
-            url,
-            status
-        )
+        video_path = await download_with_status(url, status)
 
         if not video_path:
             return
 
-    except Exception as error:
-        return await status.edit(
-            f"Download failed\n{str(error)[:500]}"
-        )
+        await status.edit("Processing video...")
 
-    await status.edit(
-        "Processing video..."
-    )
-
-    try:
         zip_path = await process_video(
             video_path,
             user_id,
@@ -709,9 +653,7 @@ async def url_handler(_, msg):
         )
 
         if not zip_path:
-            return await status.edit(
-                "Processing failed"
-            )
+            return await status.edit("Processing failed")
 
         await msg.reply_document(
             zip_path,
@@ -722,46 +664,33 @@ async def url_handler(_, msg):
             )
         )
 
-        await status.edit(
-            "Done! Check the ZIP file above."
-        )
+        await status.edit("Done! Check the ZIP file above.")
+
+    except Exception as error:
+        log.exception("URL handler failed for user %s", user_id)
+        try:
+            await status.edit(
+                f"Download or processing failed\n{str(error)[:500]}"
+            )
+        except Exception:
+            pass
 
     finally:
-        for path in (video_path,):
+        for path in (video_path, zip_path):
             try:
                 if path and os.path.exists(path):
                     os.remove(path)
             except Exception:
-                log.exception(
-                    "Could not remove downloaded video"
-                )
-
-        if 'zip_path' in locals() and zip_path:
-            try:
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-            except Exception:
-                log.exception(
-                    "Could not remove output ZIP"
-                )
+                log.exception("Could not remove URL temporary file")
 
 
 @bot.on_message(filters.video)
 async def video_handler(_, msg):
-
     user_id = msg.from_user.id
-
-    target = min(
-        get_count(user_id),
-        MAX_LIMIT
-    )
-
+    target = min(get_count(user_id), MAX_LIMIT)
     cancel_users[user_id] = False
 
-    status = await msg.reply(
-        "Downloading video..."
-    )
-
+    status = await msg.reply("Downloading video...")
     video_path = None
     zip_path = None
 
@@ -771,13 +700,9 @@ async def video_handler(_, msg):
         )
 
         if not video_path:
-            return await status.edit(
-                "Video download failed"
-            )
+            return await status.edit("Video download failed")
 
-        await status.edit(
-            "Processing video..."
-        )
+        await status.edit("Processing video...")
 
         zip_path = await process_video(
             video_path,
@@ -787,9 +712,7 @@ async def video_handler(_, msg):
         )
 
         if not zip_path:
-            return await status.edit(
-                "Processing failed"
-            )
+            return await status.edit("Processing failed")
 
         await msg.reply_document(
             zip_path,
@@ -800,9 +723,7 @@ async def video_handler(_, msg):
             )
         )
 
-        await status.edit(
-            "Done! Check the ZIP file above."
-        )
+        await status.edit("Done! Check the ZIP file above.")
 
     except Exception as error:
         log.exception(
@@ -810,9 +731,12 @@ async def video_handler(_, msg):
             user_id
         )
 
-        await status.edit(
-            f"Video processing error:\n{str(error)[:500]}"
-        )
+        try:
+            await status.edit(
+                f"Video processing error:\n{str(error)[:500]}"
+            )
+        except Exception:
+            pass
 
     finally:
         for path in (video_path, zip_path):
@@ -820,14 +744,11 @@ async def video_handler(_, msg):
                 if path and os.path.exists(path):
                     os.remove(path)
             except Exception:
-                log.exception(
-                    "Could not remove temporary file"
-                )
+                log.exception("Could not remove temporary file")
 
 
 @bot.on_message(filters.command("help"))
 async def help_command(_, msg):
-
     limits = get_current_limits()
 
     await msg.reply(
@@ -843,8 +764,7 @@ async def help_command(_, msg):
         f"• `/limits` - Show current limits\n\n"
         f"**Limits:**\n"
         f"• Max Size: {limits['max_size_gb']} GB\n"
-        f"• Max Duration: "
-        f"{limits['max_duration_minutes']} minutes\n\n"
+        f"• Max Duration: {limits['max_duration_minutes']} minutes\n\n"
         f"**Features:**\n"
         f"• Smart scene detection\n"
         f"• Motion analysis\n"
@@ -864,7 +784,6 @@ async def help_command(_, msg):
 
 @bot.on_message(filters.command("up"))
 async def up_command(_, msg):
-
     user_id = msg.from_user.id
 
     upscale_waiting.add(user_id)
@@ -888,7 +807,6 @@ async def up_command(_, msg):
 
 @bot.on_message(filters.command("caption"))
 async def set_upscale_caption(_, msg):
-
     user_id = msg.from_user.id
 
     if user_id not in upscale_waiting:
@@ -904,9 +822,7 @@ async def set_upscale_caption(_, msg):
     caption = msg.text.split(" ", 1)[1].strip()
 
     if not caption:
-        return await msg.reply(
-            "Caption cannot be empty."
-        )
+        return await msg.reply("Caption cannot be empty.")
 
     if len(caption) > 1024:
         return await msg.reply(
@@ -924,20 +840,15 @@ async def set_upscale_caption(_, msg):
 
 @bot.on_message(filters.document)
 async def upscale_zip_handler(_, msg):
-
     user_id = msg.from_user.id
 
     if user_id not in upscale_waiting:
         return
 
-    filename = (
-        msg.document.file_name or ""
-    ).lower()
+    filename = (msg.document.file_name or "").lower()
 
     if not filename.endswith(".zip"):
-        return await msg.reply(
-            "Please send a ZIP file."
-        )
+        return await msg.reply("Please send a ZIP file.")
 
     upscale_waiting.discard(user_id)
     upscale_cancelled.discard(user_id)
@@ -956,11 +867,10 @@ async def upscale_zip_handler(_, msg):
         str(user_id)
     )
 
+    zip_path = None
+
     try:
-        os.makedirs(
-            user_dir,
-            exist_ok=True
-        )
+        os.makedirs(user_dir, exist_ok=True)
 
         zip_path = await msg.download(
             file_name=os.path.join(
@@ -968,6 +878,9 @@ async def upscale_zip_handler(_, msg):
                 "input.zip"
             )
         )
+
+        if not zip_path:
+            raise RuntimeError("ZIP download returned no file path")
 
     except Exception as error:
         cleanup_user(user_id)
@@ -982,13 +895,9 @@ async def upscale_zip_handler(_, msg):
     )
 
     loop = asyncio.get_running_loop()
-
-    last_update = {
-        "percent": -1
-    }
+    last_update = {"percent": -1}
 
     async def update_status(percent, current, total):
-
         if (
             percent == last_update["percent"]
             and percent != 100
@@ -996,12 +905,8 @@ async def upscale_zip_handler(_, msg):
             return
 
         last_update["percent"] = percent
-
         bar_length = 12
-
-        filled = int(
-            bar_length * percent / 100
-        )
+        filled = int(bar_length * percent / 100)
 
         bar = (
             "█" * filled
@@ -1021,14 +926,9 @@ async def upscale_zip_handler(_, msg):
             pass
 
     def progress_callback(percent, current, total):
-
         try:
             asyncio.run_coroutine_threadsafe(
-                update_status(
-                    percent,
-                    current,
-                    total
-                ),
+                update_status(percent, current, total),
                 loop
             )
         except Exception:
@@ -1039,6 +939,11 @@ async def upscale_zip_handler(_, msg):
             user_id in upscale_cancelled
             or is_shutting_down()
         )
+
+    output_zip = None
+    processed = 0
+    failed = 0
+    cancelled = False
 
     try:
         (
@@ -1056,7 +961,6 @@ async def upscale_zip_handler(_, msg):
         )
 
     except Exception as error:
-
         log.exception(
             "Upscaling failed for user %s",
             user_id
@@ -1071,7 +975,6 @@ async def upscale_zip_handler(_, msg):
         )
 
     if cancelled:
-
         cleanup_user(user_id)
         upscale_cancelled.discard(user_id)
         upscale_captions.pop(user_id, None)
@@ -1081,17 +984,11 @@ async def upscale_zip_handler(_, msg):
             f"📸 Processed before cancellation: **{processed}**"
         )
 
-    if (
-        not output_zip
-        or not os.path.exists(output_zip)
-    ):
-
+    if not output_zip or not os.path.exists(output_zip):
         cleanup_user(user_id)
         upscale_captions.pop(user_id, None)
 
-        return await status.edit(
-            "Output ZIP was not created."
-        )
+        return await status.edit("Output ZIP was not created.")
 
     await status.edit(
         "📦 **Upscaling complete!**\n\n"
@@ -1099,7 +996,6 @@ async def upscale_zip_handler(_, msg):
     )
 
     try:
-
         await msg.reply_document(
             output_zip,
             caption=caption
@@ -1114,13 +1010,11 @@ async def upscale_zip_handler(_, msg):
         )
 
     except Exception as error:
-
         await status.edit(
             f"Failed to send ZIP\n\n{error}"
         )
 
     finally:
-
         cleanup_user(user_id)
         upscale_cancelled.discard(user_id)
         upscale_caption_waiting.discard(user_id)
@@ -1129,11 +1023,9 @@ async def upscale_zip_handler(_, msg):
 
 @bot.on_message(filters.command("cancel"))
 async def cancel_upscale(_, msg):
-
     user_id = msg.from_user.id
 
     if user_id in upscale_waiting:
-
         upscale_waiting.discard(user_id)
         upscale_caption_waiting.discard(user_id)
         upscale_cancelled.discard(user_id)
@@ -1158,7 +1050,6 @@ async def cancel_upscale(_, msg):
 # ============================================================
 
 def _human_uptime(seconds):
-
     seconds = int(seconds)
 
     days, rem = divmod(seconds, 86400)
@@ -1169,10 +1060,8 @@ def _human_uptime(seconds):
 
     if days:
         parts.append(f"{days}d")
-
     if hours:
         parts.append(f"{hours}h")
-
     if minutes:
         parts.append(f"{minutes}m")
 
@@ -1182,12 +1071,10 @@ def _human_uptime(seconds):
 
 
 def _dir_size_mb(path):
-
     total = 0
 
     try:
         for root, _, files in os.walk(path):
-
             for name in files:
                 try:
                     total += os.path.getsize(
@@ -1195,7 +1082,6 @@ def _dir_size_mb(path):
                     )
                 except OSError:
                     pass
-
     except Exception:
         pass
 
@@ -1203,10 +1089,7 @@ def _dir_size_mb(path):
 
 
 async def _health_report():
-
     import shutil as _shutil
-
-    # Process uptime
 
     uptime_seconds = None
 
@@ -1215,14 +1098,8 @@ async def _health_report():
             stat = f.read().split()
 
         starttime_ticks = int(stat[21])
-
-        clock_ticks_per_sec = os.sysconf(
-            "SC_CLK_TCK"
-        )
-
-        boot_seconds = time.clock_gettime(
-            time.CLOCK_BOOTTIME
-        )
+        clock_ticks_per_sec = os.sysconf("SC_CLK_TCK")
+        boot_seconds = time.clock_gettime(time.CLOCK_BOOTTIME)
 
         uptime_seconds = (
             boot_seconds
@@ -1232,61 +1109,31 @@ async def _health_report():
     except Exception:
         uptime_seconds = None
 
-    if (
-        uptime_seconds is None
-        or uptime_seconds <= 0
-    ):
-        uptime_seconds = (
-            time.time() - _BOT_START_TIME
-        )
-
-    # Memory
+    if uptime_seconds is None or uptime_seconds <= 0:
+        uptime_seconds = time.time() - _BOT_START_TIME
 
     mem_mb = None
 
     try:
         with open("/proc/self/status") as f:
-
             for line in f:
                 if line.startswith("VmRSS:"):
-
-                    mem_mb = (
-                        int(line.split()[1]) / 1024.0
-                    )
-
+                    mem_mb = int(line.split()[1]) / 1024.0
                     break
-
     except Exception:
         pass
 
-    # Disk
-
     try:
         disk = _shutil.disk_usage(".")
-
-        disk_used_pct = (
-            disk.used / disk.total
-        ) * 100
-
-        disk_free_gb = (
-            disk.free / (1024 ** 3)
-        )
-
+        disk_used_pct = (disk.used / disk.total) * 100
+        disk_free_gb = disk.free / (1024 ** 3)
     except Exception:
         disk_used_pct = None
         disk_free_gb = None
 
-    iv_work_mb = _dir_size_mb(
-        "image_video_work"
-    )
-
-    downloads_mb = _dir_size_mb(
-        DOWNLOAD_DIR
-    )
-
-    output_mb = _dir_size_mb(
-        OUTPUT_DIR
-    )
+    iv_work_mb = _dir_size_mb("image_video_work")
+    downloads_mb = _dir_size_mb(DOWNLOAD_DIR)
+    output_mb = _dir_size_mb(OUTPUT_DIR)
 
     try:
         from image_video import sessions as iv_sessions
@@ -1309,20 +1156,12 @@ async def _health_report():
     flask_ok = False
 
     try:
-        port = os.environ.get(
-            "PORT",
-            "10000"
-        )
-
+        port = os.environ.get("PORT", "10000")
         response = requests.get(
             f"http://127.0.0.1:{port}/health",
             timeout=3
         )
-
-        flask_ok = (
-            response.status_code == 200
-        )
-
+        flask_ok = response.status_code == 200
     except Exception:
         flask_ok = False
 
@@ -1336,9 +1175,7 @@ async def _health_report():
     ]
 
     if mem_mb is not None:
-        lines.append(
-            f"💾 Memory (RSS): `{mem_mb:.1f} MB`"
-        )
+        lines.append(f"💾 Memory (RSS): `{mem_mb:.1f} MB`")
 
     lines.append(
         f"🔁 Shutting down: `{'yes' if shutting else 'no'}`"
@@ -1373,21 +1210,14 @@ async def _health_report():
     return "\n".join(lines)
 
 
-@bot.on_message(
-    filters.command(["heal", "health"])
-)
+@bot.on_message(filters.command(["heal", "health"]))
 async def health_command(_, msg):
-
     try:
         report = await _health_report()
         await msg.reply(report)
 
     except Exception as error:
-
-        log.exception(
-            "Health report failed: %s",
-            error
-        )
+        log.exception("Health report failed: %s", error)
 
         await msg.reply(
             f"Health check failed: `{str(error)[:300]}`"
@@ -1407,78 +1237,48 @@ register_image_video_handlers(bot)
 
 def run_bot_forever():
     """
-    Run Pyrogram using one consistent asyncio event loop.
+    Run Pyrogram on the exact event loop captured by Client.
 
-    Fixes:
-    - Client event-loop mismatch
-    - Dispatcher tasks attached to another loop
-    - Graceful shutdown
-    - Connection monitoring
+    The loop is created and installed before Client construction.
+    It is reused for bot.start(), dispatcher workers, and bot.stop().
     """
 
-    # Clear stale shutdown flag from previous process.
-
+    # Ensure this process owns the shutdown flag.
     try:
         if os.path.exists(SHUTDOWN_FLAG):
             os.remove(SHUTDOWN_FLAG)
-
             log.warning(
                 "Removed stale shutdown flag: %s",
                 SHUTDOWN_FLAG
             )
-
     except Exception:
-        log.exception(
-            "Could not clear stale shutdown flag"
-        )
+        log.exception("Could not clear stale shutdown flag")
 
     # Install signal handlers.
-
     def _on_signal(signum, _frame):
-
         log.warning(
             "Signal %s received in bot process",
             signum
         )
-
         request_shutdown()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
-
         try:
-            signal.signal(
-                sig,
-                _on_signal
-            )
-
+            signal.signal(sig, _on_signal)
         except (ValueError, OSError):
-            log.exception(
-                "Could not install signal handler"
-            )
+            log.exception("Could not install signal handler")
 
     log.info("Bot starting")
+    log.info(
+        "Using dedicated Pyrogram event loop: %s",
+        id(_BOT_LOOP)
+    )
 
     async def _run():
-
-        # IMPORTANT EVENT LOOP FIX.
-        # Client was created before asyncio.run().
-        # Assign the currently running loop before starting Pyrogram.
-
-        current_loop = asyncio.get_running_loop()
-
-        bot.loop = current_loop
-
-        log.info(
-            "Pyrogram event loop assigned: %s",
-            id(current_loop)
-        )
-
         started = False
 
         try:
-
             await bot.start()
-
             started = True
 
             log.info(
@@ -1486,58 +1286,37 @@ def run_bot_forever():
                 bot.is_connected
             )
 
-            # Verify Telegram API.
-
             try:
-
                 me = await bot.get_me()
-
                 log.info(
                     "Bot identity: @%s (id=%s)",
                     me.username,
                     me.id
                 )
-
             except Exception:
-                log.exception(
-                    "Telegram get_me failed"
-                )
+                log.exception("Telegram get_me failed")
 
             last_health = 0.0
 
             while not is_shutting_down():
-
                 now = time.time()
 
                 if now - last_health >= 60:
-
                     try:
                         connected = bot.is_connected
                     except Exception:
                         connected = False
 
                     if not connected:
-
-                        log.warning(
-                            "Pyrogram connection dropped"
-                        )
+                        log.warning("Pyrogram connection dropped")
 
                         try:
-
                             if started:
-
                                 await bot.stop()
-
                                 started = False
 
-                            # Reuse the same running event loop.
-
-                            bot.loop = (
-                                asyncio.get_running_loop()
-                            )
-
+                            # Restart on the same dedicated event loop.
                             await bot.start()
-
                             started = True
 
                             log.info(
@@ -1545,69 +1324,78 @@ def run_bot_forever():
                             )
 
                             me = await bot.get_me()
-
                             log.info(
                                 "Bot identity after restart: @%s",
                                 me.username
                             )
 
                         except Exception:
-                            log.exception(
-                                "Pyrogram restart failed"
-                            )
+                            log.exception("Pyrogram restart failed")
 
                     last_health = now
 
                 await asyncio.sleep(1)
 
         finally:
-
             if started:
-
                 log.info(
                     "Shutdown requested - stopping bot"
                 )
 
                 try:
-
                     await bot.stop()
-
-                    log.info(
-                        "Bot stopped cleanly"
-                    )
-
+                    log.info("Bot stopped cleanly")
                 except Exception:
-                    log.exception(
-                        "Bot shutdown failed"
-                    )
+                    log.exception("Bot shutdown failed")
 
     try:
-
-        # Run the bot on one event loop.
-
-        asyncio.run(_run())
+        # Do not use asyncio.run(): it creates a different event loop.
+        asyncio.set_event_loop(_BOT_LOOP)
+        _BOT_LOOP.run_until_complete(_run())
 
     except KeyboardInterrupt:
-
-        log.info(
-            "KeyboardInterrupt - exiting bot"
-        )
+        log.info("KeyboardInterrupt - exiting bot")
 
     except Exception:
-
-        log.exception(
-            "Bot loop error"
-        )
+        log.exception("Bot loop error")
 
     finally:
+        # Finish any remaining tasks on this same loop before closing it.
+        try:
+            pending = asyncio.all_tasks(_BOT_LOOP)
 
-        log.info(
-            "Bot process exiting"
-        )
+            for task in pending:
+                task.cancel()
+
+            if pending:
+                _BOT_LOOP.run_until_complete(
+                    asyncio.gather(
+                        *pending,
+                        return_exceptions=True
+                    )
+                )
+
+            _BOT_LOOP.run_until_complete(
+                _BOT_LOOP.shutdown_asyncgens()
+            )
+
+        except Exception:
+            log.exception("Error while cleaning up event loop")
+
+        try:
+            _BOT_LOOP.close()
+        except Exception:
+            log.exception("Could not close bot event loop")
+
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+
+        log.info("Bot process exiting")
 
         try:
             if os.path.exists(SHUTDOWN_FLAG):
                 os.remove(SHUTDOWN_FLAG)
-
         except Exception:
             pass
