@@ -8,7 +8,8 @@ import logging
 import requests
 from flask import Flask
 
-from bot import bot
+# Import the shutdown-aware entry point, not `bot` directly
+from bot import run_bot_forever, request_shutdown, is_shutting_down, SHUTDOWN_FLAG
 
 # ---------------- LOGGING ----------------
 
@@ -24,6 +25,8 @@ log = logging.getLogger("app")
 
 app = Flask(__name__)
 
+_START_TIME = time.time()
+
 
 @app.route("/")
 def home():
@@ -32,33 +35,30 @@ def home():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "uptime": time.time() - _START_TIME}
-
-
-_START_TIME = time.time()
+    return {
+        "status": "ok",
+        "uptime": time.time() - _START_TIME,
+        "shutting_down": is_shutting_down(),
+    }
 
 
 def run_flask():
-    # threaded=True so /health doesn't block behind slow renders
     app.run(host="0.0.0.0", port=10000, threaded=True)
 
 
 # ---------------- KEEPALIVE (free-tier) ----------------
 
 def _keepalive_loop():
-    """
-    Ping our own public URL every 10 minutes so Render's free tier
-    doesn't idle-kill the service after 15 minutes of no HTTP traffic.
-    RENDER_EXTERNAL_URL is set automatically by Render.
-    """
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
         log.info("keepalive disabled (no RENDER_EXTERNAL_URL)")
         return
     target = url.rstrip("/") + "/health"
     log.info("keepalive started -> %s every 600s", target)
-    while True:
+    while not is_shutting_down():
         time.sleep(600)
+        if is_shutting_down():
+            return
         try:
             r = requests.get(target, timeout=10)
             log.info("keepalive ping ok status=%s", r.status_code)
@@ -74,6 +74,12 @@ _shutdown_event = threading.Event()
 def _handle_signal(signum, _frame):
     log.warning("signal received: %s - shutting down gracefully", signum)
     _shutdown_event.set()
+    # Tell bot.py to stop, write the SHUTDOWN_FLAG file so in-flight
+    # renders abort cleanly instead of dying mid-write.
+    try:
+        request_shutdown()
+    except Exception as error:
+        log.warning("request_shutdown failed: %s", error)
 
 
 def _install_signal_handlers():
@@ -92,15 +98,21 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True, name="flask").start()
     threading.Thread(target=_keepalive_loop, daemon=True, name="keepalive").start()
 
-    log.info("starting pyrogram bot in main thread")
+    log.info("starting pyrogram bot (run_bot_forever) in main thread")
 
     try:
-        # Pyrogram's bot.run() blocks until stopped.
-        bot.run()
+        run_bot_forever()
     except KeyboardInterrupt:
         log.info("KeyboardInterrupt - exiting")
+    except Exception as error:
+        log.exception("bot loop error: %s", error)
     finally:
         if _shutdown_event.is_set():
             log.info("shutdown event was set - clean exit")
         else:
-            log.info("bot.run() returned - exiting")
+            log.info("run_bot_forever() returned - exiting")
+        try:
+            if os.path.exists(SHUTDOWN_FLAG):
+                os.remove(SHUTDOWN_FLAG)
+        except Exception:
+            pass
